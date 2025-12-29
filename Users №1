@@ -1,18 +1,18 @@
 {
-  "data": {
-    "id": "...",
-    "data": {
-      "users": [
-        {
-          "hwid": "ABC",
-          "role": "admin",
-          "login": "cyn",
-          "status": "default",
-          "password": "qwerty1"
-        }
-      ]
+  "users": [
+    {
+      "login": "cyn",
+      "password": "qwerty1",
+      "hwid": "ABC",
+      "status": "default",
+      "role": "admin"
     },
-    "createdAt": "...",
-    "updatedAt": "..."
-  }
+    {
+      "login": "drk",
+      "password": "qwerty2",
+      "hwid": "DEF",
+      "status": "default",
+      "role": "user"
+    }
+  ]
 }
