@@ -4,9 +4,9 @@
       {
         "login": "cyn",
         "role": "admin",
-        "status": "blocked",
+        "status": "default",
         "password_hash": "12276e8207a56e88b7d52aa7f3b6fcd74c73b80e3814b4bc820cee615d88135e",
-        "hwid_hash": "eaf4c00318b3c5038a0d53d5e7bf3866f85149872e3cd3008a2fb51c4c662964",
+        "hwid_hash": "eaf4c00318b3c5038a0d53d5e7bf3866f85149872e3cd3008a2fb51c4c662964 1",
         "license_until": "2026-12-31"
       }
     ]
