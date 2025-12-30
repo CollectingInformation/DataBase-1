@@ -8,7 +8,410 @@
         "password_hash": "12276e8207a56e88b7d52aa7f3b6fcd74c73b80e3814b4bc820cee615d88135e",
         "hwid_hash": "eaf4c00318b3c5038a0d53d5e7bf3866f85149872e3cd3008a2fb51c4c662964",
         "license_until": "2026-12-31"
+      },
+
+      {
+        "login": "2",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "2",
+        "hwid_hash": "2",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "3",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "3",
+        "hwid_hash": "3",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "4",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "4",
+        "hwid_hash": "4",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "5",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "5",
+        "hwid_hash": "5",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "6",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "6",
+        "hwid_hash": "6",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "7",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "7",
+        "hwid_hash": "7",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "8",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "8",
+        "hwid_hash": "8",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "9",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "9",
+        "hwid_hash": "9",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "10",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "10",
+        "hwid_hash": "10",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "11",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "11",
+        "hwid_hash": "11",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "12",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "12",
+        "hwid_hash": "12",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "13",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "13",
+        "hwid_hash": "13",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "14",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "14",
+        "hwid_hash": "14",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "15",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "15",
+        "hwid_hash": "15",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "16",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "16",
+        "hwid_hash": "16",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "17",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "17",
+        "hwid_hash": "17",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "18",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "18",
+        "hwid_hash": "18",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "19",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "19",
+        "hwid_hash": "19",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "20",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "20",
+        "hwid_hash": "20",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "21",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "21",
+        "hwid_hash": "21",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "22",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "22",
+        "hwid_hash": "22",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "23",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "23",
+        "hwid_hash": "23",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "24",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "24",
+        "hwid_hash": "24",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "25",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "25",
+        "hwid_hash": "25",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "26",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "26",
+        "hwid_hash": "26",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "27",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "27",
+        "hwid_hash": "27",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "28",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "28",
+        "hwid_hash": "28",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "29",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "29",
+        "hwid_hash": "29",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "30",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "30",
+        "hwid_hash": "30",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "31",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "31",
+        "hwid_hash": "31",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "32",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "32",
+        "hwid_hash": "32",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "33",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "33",
+        "hwid_hash": "33",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "34",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "34",
+        "hwid_hash": "34",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "35",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "35",
+        "hwid_hash": "35",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "36",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "36",
+        "hwid_hash": "36",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "37",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "37",
+        "hwid_hash": "37",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "38",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "38",
+        "hwid_hash": "38",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "39",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "39",
+        "hwid_hash": "39",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "40",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "40",
+        "hwid_hash": "40",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "41",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "41",
+        "hwid_hash": "41",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "42",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "42",
+        "hwid_hash": "42",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "43",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "43",
+        "hwid_hash": "43",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "44",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "44",
+        "hwid_hash": "44",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "45",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "45",
+        "hwid_hash": "45",
+        "license_until": "2024-01-01"
+      },
+
+      {
+        "login": "46",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "46",
+        "hwid_hash": "46",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "47",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "47",
+        "hwid_hash": "47",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "48",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "48",
+        "hwid_hash": "48",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "49",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "49",
+        "hwid_hash": "49",
+        "license_until": "2024-01-01"
+      },
+      {
+        "login": "50",
+        "role": "user",
+        "status": "disable",
+        "password_hash": "50",
+        "hwid_hash": "50",
+        "license_until": "2024-01-01"
       }
     ]
   }
 }
+
