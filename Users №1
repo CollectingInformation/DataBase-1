@@ -11,12 +11,12 @@
       },
 
       {
-        "login": "2",
+        "login": "Hizashi",
         "role": "user",
-        "status": "disable",
-        "password_hash": "2",
-        "hwid_hash": "2",
-        "license_until": "2024-01-01"
+        "status": "default",
+        "password_hash": "f6c71c18bae0f3b6bcab24f3d12886a4b11ad2b3b52ff77694593fb9c09c885c",
+        "hwid_hash": "25f530ab3759266e75bfa7b7df29a9cf492976d6d9013a7b788ed9dd44e9a6ca",
+        "license_until": "2026-12-31"
       },
       {
         "login": "3",
