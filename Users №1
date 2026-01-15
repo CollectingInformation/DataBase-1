@@ -5,7 +5,6 @@
         "login": "cyn",
         "role": "admin",
         "status": "default",
-        "password_hash": "12276e8207a56e88b7d52aa7f3b6fcd74c73b80e3814b4bc820cee615d88135e",
         "hwid_hash": "eaf4c00318b3c5038a0d53d5e7bf3866f85149872e3cd3008a2fb51c4c662964",
         "license_until": "2026-12-31"
       },
@@ -23,7 +22,7 @@
         "role": "user",
         "status": "disable",
         "password_hash": "3",
-        "hwid_hash": "3",
+        "hwid_hash": "eaf4c00318b3c5038a0d53d5e7bf3866f85149872e3cd3008a2fb51c4c662964",
         "license_until": "2024-01-01"
       },
       {
