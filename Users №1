@@ -33,8 +33,8 @@
         "login": "forzet125",
         "role": "user",
         "status": "blocked",
-        "password_hash": "12276e8207a56e88b7d52aa7f3b6fcd74c73b80e3814b4bc820cee615d88135e",
-        "hwid_hash": "eaf4c00318b3c5038a0d53d5e7bf3866f85149872e3cd3008a2fb51c4c662964",
+        "password_hash": "09ad188224bf3515d92e465ad5bfbfc38b25e3002cc86f430b958c0aa4667090",
+        "hwid_hash": "33710490fb372158b5e626e1c41e105961c81c9200fb8dd86831d21d24e58763",
         "history": "The account was created on 27.03.2026\n\n[!] The account was blocked by the administrator cyn on forever. reason not specified. Blocking date 28.03.2026",
         "license_until": "31.03.2026"
       },
