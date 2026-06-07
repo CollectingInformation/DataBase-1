@@ -122,13 +122,29 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                 if (megaRooms == 1) {
                     if (!isNearMegaRooms(x, z, world)) {
 
-                        // Чистый рандом комнат автора (1-6). Семёрку убрали, чтобы чанки прогружались быстро!
-                        megaRooms = random.nextBetween(1, 6);
+                        // Задаем случайное число от 1 до 7
+                        megaRooms = random.nextBetween(1, 7);
                         roomIdentifier = new Identifier(SPBRevamped.MOD_ID, "level0/megaroom" + megaRooms);
                         structurePlacementData.setMirror(BlockMirror.NONE).setRotation(BlockRotation.NONE).setIgnoreEntities(true);
                         optional = structureTemplateManager.getTemplate(roomIdentifier);
 
-                        if (optional.isPresent()) {
+                        if (megaRooms == 7) {
+                            // АВТОНОМНЫЙ ВЫЗОВ: Берем файл напрямую из папки мода без авторских ограничений
+                            Optional<StructureTemplate> t7 = structureTemplateManager.getTemplate(new Identifier(SPBRevamped.MOD_ID, "level0/megaroom7"));
+                            
+                            if (t7.isPresent()) {
+                                t7.get().place(
+                                        world,
+                                        mutable.set(x - 16, 18, z - 16),
+                                        mutable.set(x - 16, 18, z - 16),
+                                        structurePlacementData, random, 2);
+                            }
+                            
+                            // Принудительно застраиваем лабиринт вокруг нашей комнаты
+                            Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
+                            level0MazeGenerator.setup(world, false, false, false);
+                        } 
+                        else if (optional.isPresent()) {
                             // Оригинальные комнаты автора 1 и 2 склеиваются из 4 кусков, как раньше
                             if (megaRooms == 1 || megaRooms == 2) {
                                 optional.get().place(
@@ -171,6 +187,7 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                     level0MazeGenerator.setup(world, false, false, false);
                 }
             }
+
 
 
 
