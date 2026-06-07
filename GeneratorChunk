@@ -118,8 +118,7 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                 }
 
 
-                
-                if (megaRooms == 1) {
+                                if (megaRooms == 1) {
                     if (!isNearMegaRooms(x, z, world)) {
 
                         // Задаем случайное число от 1 до 7
@@ -133,10 +132,23 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                             Optional<StructureTemplate> t7 = structureTemplateManager.getTemplate(new Identifier(SPBRevamped.MOD_ID, "level0/megaroom7"));
                             
                             if (t7.isPresent()) {
-                                t7.get().place(
+                                StructureTemplate template = t7.get();
+                                
+                                // НАСТРОЙКА ЦЕНТРА: Рассчитываем глобальную сетку 8х8 чанков под базу 128х128 блоков
+                                int cellX = Math.floorDiv(chunk.getPos().x, 8) * 8;
+                                int cellZ = Math.floorDiv(chunk.getPos().z, 8) * 8;
+                                int startX = cellX * 16;
+                                int startZ = cellZ * 16;
+
+                                // ОГРАНИЧЕНИЕ BOX: Заставляем игру ставить блоки ТОЛЬКО в границах текущего чанка 16х16.
+                                net.minecraft.util.math.BlockBox chunkBox = new net.minecraft.util.math.BlockBox(x, 0, z, x + 15, 256, z + 15);
+                                structurePlacementData.setBoundingBox(chunkBox);
+
+                                // Впечатываем кусок структуры для текущего чанка за один миг через template
+                                template.place(
                                         world,
-                                        mutable.set(x - 16, 18, z - 16),
-                                        mutable.set(x - 16, 18, z - 16),
+                                        mutable.set(startX, 18, startZ),
+                                        mutable.set(startX, 18, startZ),
                                         structurePlacementData, random, 2);
                             }
                             
@@ -147,33 +159,13 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                         else if (optional.isPresent()) {
                             // Оригинальные комнаты автора 1 и 2 склеиваются из 4 кусков, как раньше
                             if (megaRooms == 1 || megaRooms == 2) {
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 32, 18, z - 32),
-                                        mutable.set(x - 32, 18, z - 32),
-                                        structurePlacementData, random, 2);
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x, 18, z - 32),
-                                        mutable.set(x, 18, z - 32),
-                                        structurePlacementData, random, 2);
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 32, 18, z),
-                                        mutable.set(x - 32, 18, z),
-                                        structurePlacementData, random, 2);
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x, 18, z),
-                                        mutable.set(x, 18, z),
-                                        structurePlacementData, random, 2);
+                                optional.get().place(world, mutable.set(x - 32, 18, z - 32), mutable.set(x - 32, 18, z - 32), structurePlacementData, random, 2);
+                                optional.get().place(world, mutable.set(x, 18, z - 32), mutable.set(x, 18, z - 32), structurePlacementData, random, 2);
+                                optional.get().place(world, mutable.set(x - 32, 18, z), mutable.set(x - 32, 18, z), structurePlacementData, random, 2);
+                                optional.get().place(world, mutable.set(x, 18, z), mutable.set(x, 18, z), structurePlacementData, random, 2);
                             } else {
                                 // Старые комнаты автора (3, 4, 5, 6) спавнятся со сдвигом, как раньше
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 16, 18, z - 16),
-                                        mutable.set(x - 16, 18, z - 16),
-                                        structurePlacementData, random, 2);
+                                optional.get().place(world, mutable.set(x - 16, 18, z - 16), mutable.set(x - 16, 18, z - 16), structurePlacementData, random, 2);
                                 Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
                                 level0MazeGenerator.setup(world, false, false, false);
                             }
@@ -187,6 +179,8 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                     level0MazeGenerator.setup(world, false, false, false);
                 }
             }
+
+
 
 
 
@@ -214,42 +208,36 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
 
     }
 
-    public boolean isNearMegaRooms(int x, int z,StructureWorldAccess world){
+    public boolean isNearMegaRooms(int x, int z, StructureWorldAccess world){
         BlockPos.Mutable mutable = new BlockPos.Mutable();
         boolean near = false;
-
         for(int i = -80; i <= 80; i += 80){
             for(int j = -80; j <= 80; j += 80){
-                BlockState blockState = world.getBlockState(mutable.set(x + i, 19, z + j));
+                BlockState blockState = world.getBlockState(mutable.set(x + i, 19, z + j)); // Или world.getBlockState
                 if (blockState == Blocks.RED_WOOL.getDefaultState()){
                     near = true;
                     break;
                 }
             }
         }
-
         return near;
     }
 
     public Identifier getRoof(){
         Random random = Random.create();
         int roofNumber = random.nextBetween(1,5);
-
         if (roofNumber == 1){
             return new Identifier(SPBRevamped.MOD_ID, "level0/roof2");
         }
         else {
-            return new Identifier(SPBRevamped.MOD_ID, "level0/roof1");
+            return new Identifier(SPBRevamped.MOD_ID, "level0/roof" + roofNumber);
         }
-
-
     }
 
     public StructurePlacementData randRotation(){
         StructurePlacementData structurePlacementData = new StructurePlacementData();
         Random random = Random.create();
         int rot = random.nextBetween(1,2);
-
         if(rot == 1){
             structurePlacementData.setMirror(BlockMirror.NONE).setRotation(BlockRotation.NONE).setIgnoreEntities(true);
         }else{
@@ -258,3 +246,4 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
         return structurePlacementData;
     }
 }
+
