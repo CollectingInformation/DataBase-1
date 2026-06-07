@@ -117,77 +117,54 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                     }
                 }
 
-                if (megaRooms == 1) {
-                    if (!isNearMegaRooms(x, z, world)) {
+        if (megaRooms == 1) {
+            if (!isNearMegaRooms(x, z, world)) {
 
-                        // Задаем случайное число от 1 до 7
-                        megaRooms = random.nextBetween(1, 7);
-                        
-                        // ИСПРАВЛЕНИЕ ПУТИ: Если выпала 7, ищем в minecraft, иначе — в моде
-                        if (megaRooms == 7) {
-                            roomIdentifier = new Identifier("minecraft", "megaroom7");
-                        } else {
-                            roomIdentifier = new Identifier(SPBRevamped.MOD_ID, "level0/megaroom" + megaRooms);
-                        }
-                        
-                        structurePlacementData.setMirror(BlockMirror.NONE).setRotation(BlockRotation.NONE).setIgnoreEntities(true);
-                        optional = structureTemplateManager.getTemplate(roomIdentifier);
+                megaRooms = random.nextBetween(1, 6);
+                roomIdentifier = new Identifier(SPBRevamped.MOD_ID, "level0/megaroom" + megaRooms);
+                structurePlacementData.setMirror(BlockMirror.NONE).setRotation(BlockRotation.NONE).setIgnoreEntities(true);
+                optional = structureTemplateManager.getTemplate(roomIdentifier);
 
-                        if (optional.isPresent()) {
-                            // Оригинальные комнаты автора 1 и 2 склеиваются из 4 кусков, как раньше
-                            if (megaRooms == 1 || megaRooms == 2) {
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 32, 18, z - 32),
-                                        mutable.set(x - 32, 18, z - 32),
-                                        structurePlacementData, random, 2);
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x, 18, z - 32),
-                                        mutable.set(x, 18, z - 32),
-                                        structurePlacementData, random, 2);
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 32, 18, z),
-                                        mutable.set(x - 32, 18, z),
-                                        structurePlacementData, random, 2);
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x, 18, z),
-                                        mutable.set(x, 18, z),
-                                        structurePlacementData, random, 2);
-                            } 
-                            // ТВОЯ ЦЕЛЬНАЯ КОМНАТА: ставится ровно ОДИН раз по центру без улета вбок и ошибок!
-                            else if (megaRooms == 7) {
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 16, 18, z - 16),
-                                        mutable.set(x - 16, 18, z - 16),
-                                        structurePlacementData, random, 2);
-                                
-                                // Достраиваем лабиринт вокруг неё
-                                Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
-                                level0MazeGenerator.setup(world, false, false, false);
-                            } else {
-                                // Старые комнаты автора (3, 4, 5, 6) спавнятся со сдвигом, как раньше
-                                optional.get().place(
-                                        world,
-                                        mutable.set(x - 16, 18, z - 16),
-                                        mutable.set(x - 16, 18, z - 16),
-                                        structurePlacementData, random, 2);
-                                Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
-                                level0MazeGenerator.setup(world, false, false, false);
-                            }
-                        }
+                if (optional.isPresent()) {
+                    if (megaRooms == 1 || megaRooms == 2) {
+                        optional.get().place(world, mutable.set(x - 32, 18, z - 32), mutable.set(x - 32, 18, z - 32), structurePlacementData, random, 2);
+                        optional.get().place(world, mutable.set(x, 18, z - 32), mutable.set(x, 18, z - 32), structurePlacementData, random, 2);
+                        optional.get().place(world, mutable.set(x - 32, 18, z), mutable.set(x - 32, 18, z), structurePlacementData, random, 2);
+                        optional.get().place(world, mutable.set(x, 18, z), mutable.set(x, 18, z), structurePlacementData, random, 2);
                     } else {
+                        optional.get().place(world, mutable.set(x - 16, 18, z - 16), mutable.set(x - 16, 18, z - 16), structurePlacementData, random, 2);
                         Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
                         level0MazeGenerator.setup(world, false, false, false);
                     }
-                } else {
-                    Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
-                    level0MazeGenerator.setup(world, false, false, false);
+                }
+            } else {
+                Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
+                level0MazeGenerator.setup(world, false, false, false);
+            }
+        } else if (megaRooms != -1) { // Добавлено условие, чтобы лабиринт автора строился везде, КРОМЕ финальной сборки нашей мега-зоны
+            Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
+            level0MazeGenerator.setup(world, false, false, false);
+        }
+
+        //// Блок для 8 x 8 Roof (ОРИГИНАЛ) ////
+        for(int i = 0; i < 2; i++) {
+            for(int j = 0; j < 2; j++) {
+                roomIdentifier = getRoof();
+                structurePlacementData = randRotation();
+                optional = structureTemplateManager.getTemplate(roomIdentifier);
+
+                if (optional.isPresent()) {
+                    if (world.getBlockState(mutable.set(x + 8 * i, 18, z + 8 * j)) != Blocks.CYAN_WOOL.getDefaultState() && world.getBlockState(mutable.set(x + 8 * i, 25, z + 8 * j)) == Blocks.AIR.getDefaultState() ){
+                        if (structurePlacementData.getRotation() == BlockRotation.CLOCKWISE_90) {
+                            optional.get().place(world, new BlockPos((x + 7) + 8 * i, 25, (z) + 8 * j), mutable.set((x + 7) + 8 * i, 25, (z) + 8 * j), structurePlacementData, random, 16);
+                        } else {
+                            optional.get().place(world, new BlockPos((x) + 8 * i, 25, (z) + 8 * j), mutable.set((x) + 8 * i, 25, (z) + 8 * j), structurePlacementData, random, 16);
+                        }
+                    }
                 }
             }
+        }
+    }
 
 
 
