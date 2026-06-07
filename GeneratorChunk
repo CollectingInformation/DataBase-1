@@ -117,34 +117,23 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                     }
                 }
 
-
-                
                 if (megaRooms == 1) {
                     if (!isNearMegaRooms(x, z, world)) {
 
                         // Задаем случайное число от 1 до 7
                         megaRooms = random.nextBetween(1, 7);
-                        roomIdentifier = new Identifier(SPBRevamped.MOD_ID, "level0/megaroom" + megaRooms);
+                        
+                        // ИСПРАВЛЕНИЕ ПУТИ: Если выпала 7, ищем в minecraft, иначе — в моде
+                        if (megaRooms == 7) {
+                            roomIdentifier = new Identifier("minecraft", "megaroom7");
+                        } else {
+                            roomIdentifier = new Identifier(SPBRevamped.MOD_ID, "level0/megaroom" + megaRooms);
+                        }
+                        
                         structurePlacementData.setMirror(BlockMirror.NONE).setRotation(BlockRotation.NONE).setIgnoreEntities(true);
                         optional = structureTemplateManager.getTemplate(roomIdentifier);
 
-                        if (megaRooms == 7) {
-                            // АВТОНОМНЫЙ ВЫЗОВ: Берем файл напрямую из папки мода без авторских ограничений
-                            Optional<StructureTemplate> t7 = structureTemplateManager.getTemplate(new Identifier(SPBRevamped.MOD_ID, "level0/megaroom7"));
-                            
-                            if (t7.isPresent()) {
-                                t7.get().place(
-                                        world,
-                                        mutable.set(x - 16, 18, z - 16),
-                                        mutable.set(x - 16, 18, z - 16),
-                                        structurePlacementData, random, 2);
-                            }
-                            
-                            // Принудительно застраиваем лабиринт вокруг нашей комнаты
-                            Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
-                            level0MazeGenerator.setup(world, false, false, false);
-                        } 
-                        else if (optional.isPresent()) {
+                        if (optional.isPresent()) {
                             // Оригинальные комнаты автора 1 и 2 склеиваются из 4 кусков, как раньше
                             if (megaRooms == 1 || megaRooms == 2) {
                                 optional.get().place(
@@ -167,6 +156,18 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                                         mutable.set(x, 18, z),
                                         mutable.set(x, 18, z),
                                         structurePlacementData, random, 2);
+                            } 
+                            // ТВОЯ ЦЕЛЬНАЯ КОМНАТА: ставится ровно ОДИН раз по центру без улета вбок и ошибок!
+                            else if (megaRooms == 7) {
+                                optional.get().place(
+                                        world,
+                                        mutable.set(x - 16, 18, z - 16),
+                                        mutable.set(x - 16, 18, z - 16),
+                                        structurePlacementData, random, 2);
+                                
+                                // Достраиваем лабиринт вокруг неё
+                                Level0MazeGenerator level0MazeGenerator = new Level0MazeGenerator(16, 5, 5, x, z, "level0");
+                                level0MazeGenerator.setup(world, false, false, false);
                             } else {
                                 // Старые комнаты автора (3, 4, 5, 6) спавнятся со сдвигом, как раньше
                                 optional.get().place(
@@ -187,7 +188,6 @@ public class Level0ChunkGenerator extends BackroomsChunkGenerator {
                     level0MazeGenerator.setup(world, false, false, false);
                 }
             }
-
 
 
 
