@@ -1,0 +1,598 @@
+// CS2AntiCheat - single-file v0.2
+// Build: Visual Studio 2022, x64, C++17
+// Project setting: C/C++ -> Advanced -> Compile As -> Compile as C++ Code (/TP)
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+#include <Windows.h>
+#include <TlHelp32.h>
+#include <Psapi.h>
+#include <Softpub.h>
+#include <Wincrypt.h>
+#include <Wintrust.h>
+#include <Shlwapi.h>
+#include <Winsock2.h>
+#include <Ws2tcpip.h>
+#include <unordered_map>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "Wintrust.lib")
+#pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Psapi.lib")
+
+namespace fs = std::filesystem;
+
+struct Config {
+    std::wstring gameProcess = L"cs2.exe";
+    int scanIntervalMs = 2000;
+    int heartbeatIntervalMs = 5000;
+    std::string serverHost = "127.0.0.1";
+    int serverPort = 54000;
+    std::string authToken = "CHANGE_ME";
+    bool showOverlay = true;
+    int overlaySeconds = 5;
+    bool requireAcStartedBeforeGame = true;
+    bool reportUnsignedProcesses = false; // informational only; never a complaint by itself
+    std::vector<std::wstring> allowedProcesses = {
+        L"cs2.exe", L"steam.exe", L"steamwebhelper.exe", L"discord.exe",
+        L"obs64.exe", L"explorer.exe", L"svchost.exe", L"RuntimeBroker.exe",
+        L"sihost.exe", L"taskhostw.exe", L"unsecapp.exe",
+        L"SecurityHealthSystray.exe", L"conhost.exe", L"ArmouryCrate.exe",
+        L"RZSurroundHelper.exe"
+    };
+    std::vector<std::wstring> suspiciousNames = {
+        L"cheatengine-x86_64.exe", L"extremeinjector.exe",
+        L"cheat_loader.exe", L"injector.exe", L"kdmapper.exe"
+    };
+    std::vector<std::wstring> trustedPathPrefixes = {
+        L"c:\\windows\\system32\", L"c:\\windows\\syswow64\",
+        L"c:\\windows\\systemapps\", L"c:\\program files\\windowsapps\"
+    };
+};
+std::vector<std::wstring> suspiciousNames = {
+    L"cheatengine-x86_64.exe",
+    L"extremeinjector.exe",
+    L"cheat_loader.exe",
+    L"injector.exe",
+    L"kdmapper.exe",
+    L"processhacker.exe"
+};
+};
+
+static std::string WideToUtf8(const std::wstring& s) {
+    if (s.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring out(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n);
+    return out;
+}
+
+static std::string JsonEscape(const std::string& s) {
+    std::ostringstream o;
+    for (char c : s) {
+        switch (c) {
+        case '\"': o << "\\\""; break;
+        case '\\': o << "\\\\"; break;
+        case '\n': o << "\\n"; break;
+        case '\r': o << "\\r"; break;
+        case '\t': o << "\\t"; break;
+        default: o << c;
+        }
+    }
+    return o.str();
+}
+
+static std::string JsonEscapeW(const std::wstring& s) {
+    return JsonEscape(WideToUtf8(s));
+}
+
+class Logger {
+public:
+    explicit Logger(const fs::path& path) : path_(path) {}
+
+    void Info(const std::string& msg) { Write("INFO", msg); }
+    void Warn(const std::string& msg) { Write("WARN", msg); }
+    void Error(const std::string& msg) { Write("ERROR", msg); }
+
+private:
+    void Write(const char* level, const std::string& msg) {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::ofstream f(path_, std::ios::app);
+        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm tm{};
+        localtime_s(&tm, &now);
+        f << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+            << " [" << level << "] " << msg << "\n";
+        std::cout << "[" << level << "] " << msg << "\n";
+    }
+    fs::path path_;
+    std::mutex mu_;
+};
+
+static bool ReadWholeFile(const fs::path& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static std::string GetJsonString(const std::string& text, const std::string& key, const std::string& fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = text.find(needle);
+    if (p == std::string::npos) return fallback;
+    p = text.find(':', p + needle.size());
+    if (p == std::string::npos) return fallback;
+    p = text.find('"', p + 1);
+    if (p == std::string::npos) return fallback;
+    size_t e = text.find('"', p + 1);
+    if (e == std::string::npos) return fallback;
+    return text.substr(p + 1, e - p - 1);
+}
+
+static int GetJsonInt(const std::string& text, const std::string& key, int fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = text.find(needle);
+    if (p == std::string::npos) return fallback;
+    p = text.find(':', p + needle.size());
+    if (p == std::string::npos) return fallback;
+    ++p;
+    while (p < text.size() && isspace((unsigned char)text[p])) ++p;
+    try { return std::stoi(text.substr(p)); }
+    catch (...) { return fallback; }
+}
+
+static bool GetJsonBool(const std::string& text, const std::string& key, bool fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = text.find(needle);
+    if (p == std::string::npos) return fallback;
+    p = text.find(':', p + needle.size());
+    if (p == std::string::npos) return fallback;
+    std::string tail = text.substr(p + 1, 16);
+    if (tail.find("true") != std::string::npos) return true;
+    if (tail.find("false") != std::string::npos) return false;
+    return fallback;
+}
+
+static Config LoadConfig(const fs::path& path) {
+    Config c;
+    std::string s;
+    if (!ReadWholeFile(path, s)) return c;
+    c.gameProcess = Utf8ToWide(GetJsonString(s, "game_process", WideToUtf8(c.gameProcess)));
+    c.scanIntervalMs = GetJsonInt(s, "scan_interval_ms", c.scanIntervalMs);
+    c.heartbeatIntervalMs = GetJsonInt(s, "heartbeat_interval_ms", c.heartbeatIntervalMs);
+    c.serverHost = GetJsonString(s, "server_host", c.serverHost);
+    c.serverPort = GetJsonInt(s, "server_port", c.serverPort);
+    c.authToken = GetJsonString(s, "auth_token", c.authToken);
+    c.showOverlay = GetJsonBool(s, "show_overlay", c.showOverlay);
+    c.overlaySeconds = GetJsonInt(s, "overlay_seconds", c.overlaySeconds);
+    c.requireAcStartedBeforeGame = GetJsonBool(s, "require_ac_started_before_game", c.requireAcStartedBeforeGame);
+    c.reportUnsignedProcesses = GetJsonBool(s, "report_unsigned_processes", c.reportUnsignedProcesses);
+    return c;
+}
+
+static std::wstring ToLowerW(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), towlower);
+    return s;
+}
+
+static std::string Sha256File(const fs::path& path) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return {};
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    std::string result;
+
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        GetLastError() != NTE_BAD_KEYSET) {
+        CloseHandle(hFile);
+        return {};
+    }
+    if (!hProv && !CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        CloseHandle(hFile);
+        return {};
+    }
+
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        CloseHandle(hFile);
+        return {};
+    }
+
+    std::vector<BYTE> buf(1024 * 1024);
+    DWORD read = 0;
+    while (ReadFile(hFile, buf.data(), (DWORD)buf.size(), &read, nullptr) && read) {
+        if (!CryptHashData(hHash, buf.data(), read, 0)) {
+            CryptDestroyHash(hHash);
+            CryptReleaseContext(hProv, 0);
+            CloseHandle(hFile);
+            return {};
+        }
+    }
+
+    BYTE hash[32];
+    DWORD hashLen = sizeof(hash);
+    if (CryptGetHashParam(hHash, HP_HASHVAL, hash, &hashLen, 0)) {
+        std::ostringstream oss;
+        for (DWORD i = 0; i < hashLen; ++i)
+            oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        result = oss.str();
+    }
+
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    CloseHandle(hFile);
+    return result;
+}
+
+static SignatureState CheckSignature(const fs::path& path) {
+    WINTRUST_FILE_INFO fi{};
+    fi.cbStruct = sizeof(fi);
+    fi.pcwszFilePath = path.c_str();
+
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_IGNORE;
+    wd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    LONG status = WinVerifyTrust(nullptr, &policy, &wd);
+    if (status == ERROR_SUCCESS) return SignatureState::Valid;
+    if (status == TRUST_E_NOSIGNATURE || status == TRUST_E_SUBJECT_FORM_UNKNOWN || status == TRUST_E_PROVIDER_UNKNOWN)
+        return SignatureState::Invalid;
+    return SignatureState::Unknown;
+}
+
+static std::wstring QueryProcessPath(HANDLE hProcess) {
+    wchar_t path[MAX_PATH * 4]{};
+    DWORD size = (DWORD)std::size(path);
+    if (QueryFullProcessImageNameW(hProcess, 0, path, &size))
+        return std::wstring(path, size);
+    return {};
+}
+
+static DWORD QueryParentPid(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD parent = 0;
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                parent = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return parent;
+}
+
+enum class SignatureState { Valid, Invalid, Unknown };
+enum class HashState { Valid, Failed };
+
+struct CachedFile {
+    std::string sha256;
+    HashState hashState = HashState::Failed;
+    SignatureState signature = SignatureState::Unknown;
+    uintmax_t size = 0;
+    fs::file_time_type writeTime{};
+};
+
+struct ProcInfo {
+    DWORD pid{};
+    DWORD parentPid{};
+    std::wstring name;
+    std::wstring path;
+    std::string sha256;
+    HashState hashState = HashState::Failed;
+    SignatureState signature = SignatureState::Unknown;
+};
+
+class Reporter {
+public:
+    Reporter(const Config& c, Logger& log) : cfg_(c), log_(log) {
+        WSAStartup(MAKEWORD(2, 2), &wsa_);
+    }
+
+    ~Reporter() { WSACleanup(); }
+
+    void SendEvent(const std::string& event, const std::string& session, const std::string& detail) {
+        std::ostringstream o;
+        o << "{\"auth_token\":\"" << JsonEscape(cfg_.authToken)
+            << "\",\"event\":\"" << JsonEscape(event)
+            << "\",\"session_id\":\"" << JsonEscape(session)
+            << "\",\"detail\":\"" << JsonEscape(detail) << "\"}";
+        log_.Info("EVENT " + event + " session=" + session);
+        SendRaw(o.str());
+    }
+
+
+private:
+    const Config& cfg_;
+    Logger& log_;
+    WSADATA wsa_{};
+};
+
+static HFONT gOverlayFont = nullptr;\n\nstatic LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM, LPARAM) { \n    switch (msg) { \n    case WM_ERASEBKGND: return 1;\n    case WM_PAINT: { \n        PAINTSTRUCT ps{};\n        HDC hdc = BeginPaint(hwnd, &ps);\n        RECT rc{}; GetClientRect(hwnd, &rc);\n        HBRUSH bg = CreateSolidBrush(RGB(25, 25, 25));\n        FillRect(hdc, &rc, bg); DeleteObject(bg);\n        SetBkMode(hdc, TRANSPARENT);\n        SetTextColor(hdc, RGB(240, 240, 240));\n        SelectObject(hdc, gOverlayFont);\n        DrawTextW(hdc, L"ENABLE AC", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);\n        EndPaint(hwnd, &ps);\n        return 0;\n }\n    default: return DefWindowProcW(hwnd, msg, 0, 0);\n }\n }\n\nstatic void ShowOverlayForSeconds(int seconds) { \n    if (seconds <= 0) return;\n    const wchar_t* cls = L"CS2_AC_OVERLAY_V04";\n    WNDCLASSW wc{}; wc.lpfnWndProc = OverlayWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = cls;\n    RegisterClassW(&wc);\n    gOverlayFont = CreateFontW(28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");\n    int w = 240, h = 64, x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = 30;\n    HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE, cls, L"", WS_POPUP, x, y, w, h, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);\n    if (!hwnd) { if (gOverlayFont) { DeleteObject(gOverlayFont);gOverlayFont = nullptr; } return; }\n    SetLayeredWindowAttributes(hwnd, 0, 225, LWA_ALPHA);\n    ShowWindow(hwnd, SW_SHOWNOACTIVATE); UpdateWindow(hwnd);\n    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);\n    MSG msg{};\n    while (std::chrono::steady_clock::now() < until) { while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg);DispatchMessageW(&msg); } std::this_thread::sleep_for(std::chrono::milliseconds(25)); }\n    DestroyWindow(hwnd);\n    if (gOverlayFont) { DeleteObject(gOverlayFont);gOverlayFont = nullptr; }\n    UnregisterClassW(cls, GetModuleHandleW(nullptr));\n }\n\nclass AntiCheat{
+public:
+    AntiCheat(Config cfg, Logger & log, Reporter & reporter)
+        : cfg_(std::move(cfg)), log_(log), reporter_(reporter) {
+        wchar_t buf[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        selfPath_ = fs::path(buf);
+        sessionId_ = MakeSessionId();
+    }
+
+    void Run() {
+        log_.Info("CS2 AntiCheat v0.4 starting");
+        log_.Info("session=" + sessionId_);
+        reporter_.SendEvent("session_start", sessionId_, "client_started");
+
+        DWORD existing = FindGamePid();
+        if (existing != 0 && cfg_.requireAcStartedBeforeGame) {
+            std::string detail = "reason=game_started_before_anticheat;pid=" + std::to_string(existing);
+            log_.Warn(detail);
+            reporter_.SendEvent("game_started_before_anticheat", sessionId_, detail);
+        }
+
+        if (cfg_.showOverlay) ShowOverlayForSeconds(cfg_.overlaySeconds);
+
+        std::thread scanner(&AntiCheat::ScannerLoop, this);
+        std::thread heartbeat(&AntiCheat::HeartbeatLoop, this);
+        std::thread watchdog(&AntiCheat::WatchdogLoop, this);
+
+        scanner.join();
+        heartbeat.join();
+        watchdog.join();
+    }
+
+private:
+    std::string MakeSessionId() {
+        GUID g{};
+        CoCreateGuid(&g);
+        wchar_t s[64]{};
+        StringFromGUID2(g, s, 64);
+        std::wstring w(s);
+        w.erase(std::remove(w.begin(), w.end(), L'{'), w.end());
+        w.erase(std::remove(w.begin(), w.end(), L'}'), w.end());
+        return WideToUtf8(w);
+    }
+
+
+    bool IsAllowed(const std::wstring & name) const {
+        auto n = ToLowerW(name);
+        for (const auto& a : cfg_.allowedProcesses)
+            if (n == ToLowerW(a)) return true;
+        return false;
+    }
+
+    bool IsSuspiciousName(const std::wstring & name) const {
+        auto n = ToLowerW(name);
+        for (const auto& bad : cfg_.suspiciousNames) {
+            if (n == ToLowerW(bad)) return true;
+        }
+        return false;
+    }
+
+    bool IsTrustedSystemPath(const std::wstring & path) const {
+        const auto p = ToLowerW(path);
+        for (const auto& prefix : cfg_.trustedPathPrefixes)
+            if (p.rfind(ToLowerW(prefix), 0) == 0) return true;
+        return false;
+    }
+
+    CachedFile GetFileEvidence(const fs::path & path) {
+        std::error_code ec;
+        auto size = fs::file_size(path, ec);
+        if (ec) return {};
+        auto wt = fs::last_write_time(path, ec);
+        if (ec) return {};
+        auto key = ToLowerW(path.wstring());
+        auto it = fileCache_.find(key);
+        if (it != fileCache_.end() && it->second.size == size && it->second.writeTime == wt)
+            return it->second;
+        CachedFile e;
+        e.size = size;
+        e.writeTime = wt;
+        e.sha256 = Sha256File(path);
+        e.hashState = e.sha256.empty() ? HashState::Failed : HashState::Valid;
+        e.signature = CheckSignature(path);
+        fileCache_[key] = e;
+        return e;
+    }
+
+    int CalculateRisk(const ProcInfo & p, std::string & reason) const {
+        int score = 0;
+        const bool suspicious = IsSuspiciousName(p.name);
+        const bool allowed = IsAllowed(p.name);
+        const bool systemPath = IsTrustedSystemPath(p.path);
+
+        if (suspicious) { score += 80; reason += "known_suspicious_name;"; }
+        if (p.signature == SignatureState::Invalid && !systemPath) { score += 15; reason += "invalid_signature;"; }
+        if (p.signature == SignatureState::Unknown) reason += "signature_unknown;";
+        if (p.hashState == HashState::Failed) reason += "hash_unavailable;";
+        if (!allowed && !systemPath && p.signature == SignatureState::Invalid) {
+            score += 10; reason += "unknown_unsigned_non_system;";
+        }
+        if (systemPath && score < 50) { score = std::min(score, 10); reason += "trusted_system_path;"; }
+        if (score == 0) reason = "low_signal;";
+        return score;
+    }
+
+    std::vector<ProcInfo> EnumerateProcesses() {
+        std::vector<ProcInfo> out;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return out;
+
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (!pe.th32ProcessID) continue;
+
+                HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+                if (!h) continue;
+
+                ProcInfo p;
+                p.pid = pe.th32ProcessID;
+                p.parentPid = QueryParentPid(p.pid);
+                p.name = pe.szExeFile;
+                p.path = QueryProcessPath(h);
+                if (!p.path.empty()) {
+                    auto evidence = GetFileEvidence(p.path);
+                    p.sha256 = evidence.sha256;
+                    p.hashState = evidence.hashState;
+                    p.signature = evidence.signature;
+                }
+                CloseHandle(h);
+                out.push_back(std::move(p));
+            } while (Process32NextW(snap, &pe));
+        }
+
+        CloseHandle(snap);
+        return out;
+    }
+
+    bool IsGameRunning() {
+        auto list = EnumerateProcesses();
+        for (const auto& p : list)
+            if (ToLowerW(p.name) == ToLowerW(cfg_.gameProcess))
+                return true;
+        return false;
+    }
+
+    void ScannerLoop() {
+        while (!stop_) {
+            auto list = EnumerateProcesses();
+
+            for (const auto& p : list) {
+                std::string reason;
+                int risk = CalculateRisk(p, reason);
+
+                // Low-signal/unknown processes are NOT complaints.
+                if (risk < 50) continue;
+
+                std::string key = std::to_string(p.pid) + ":" + p.sha256 + ":" + std::to_string(risk);
+                if (!reported_.insert(key).second) continue;
+
+                std::ostringstream detail;
+                detail << "risk=" << risk
+                       << ";name=" << JsonEscapeW(p.name)
+                       << ";pid=" << p.pid
+                       << ";ppid=" << p.parentPid
+                       << ";signature=";
+                switch (p.signature) {
+                case SignatureState::Valid: detail << "valid"; break;
+                case SignatureState::Invalid: detail << "invalid"; break;
+                default: detail << "unknown"; break;
+                }
+                detail << ";hash_state=" << (p.hashState == HashState::Valid ? "valid" : "unavailable")
+                       << ";sha256=" << p.sha256
+                       << ";path=" << JsonEscapeW(p.path)
+                       << ";reason=" << reason;
+
+                log_.Warn(detail.str());
+                reporter_.SendEvent("process_alert", sessionId_, detail.str());
+            }
+
+            DWORD cs2Pid = FindGamePid();
+            if (cs2Pid != 0 && !seenGame_) {
+                seenGame_ = true;
+                std::string detail = "pid=" + std::to_string(cs2Pid);
+                reporter_.SendEvent("game_started_under_ac", sessionId_, detail);
+                if (cfg_.showOverlay) std::thread(ShowOverlayForSeconds, 5).detach();
+            }
+            if (cs2Pid == 0) seenGame_ = false;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(500, cfg_.scanIntervalMs)));
+        }
+    }
+
+    void HeartbeatLoop() {
+        while (!stop_) {
+            bool game = IsGameRunning();
+            std::ostringstream d;
+            auto uptime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt_).count();
+            d << "game_running=" << (game ? "true" : "false")
+              << ";ac_uptime_sec=" << uptime;
+            reporter_.SendEvent("heartbeat", sessionId_, d.str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1000, cfg_.heartbeatIntervalMs)));
+        }
+    }
+
+    void WatchdogLoop() {
+        while (!stop_) {
+            reporter_.SendEvent("watchdog", sessionId_, "alive=true");
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+    }
+
+    Config cfg_;
+    Logger& log_;
+    Reporter& reporter_;
+    fs::path selfPath_;
+    std::string sessionId_;
+    std::chrono::steady_clock::time_point startedAt_ = std::chrono::steady_clock::now();
+    std::unordered_map<std::wstring, CachedFile> fileCache_;
+    std::unordered_set<std::string> reported_;
+    bool seenGame_ = false;
+    std::atomic<bool> stop_{false};
+};
+
+                                                                                                                                                                   int wmain() {
+                                                                                                                                                                       SetConsoleOutputCP(CP_UTF8);
+                                                                                                                                                                       SetConsoleCP(CP_UTF8);
+
+                                                                                                                                                                       fs::path base = fs::current_path();
+                                                                                                                                                                       fs::path configPath = base / L"config.json";
+                                                                                                                                                                       fs::path logPath = base / L"anticheat.log";
+
+                                                                                                                                                                       Config cfg = LoadConfig(configPath);
+                                                                                                                                                                       Logger logger(logPath);
+                                                                                                                                                                       logger.Info("CS2 AntiCheat v0.2 starting");
+
+                                                                                                                                                                       Reporter reporter(cfg, logger);
+                                                                                                                                                                       AntiCheat ac(cfg, logger, reporter);
+                                                                                                                                                                       ac.Run();
+
+                                                                                                                                                                       return 0;
+                                                                                                                                                                   }
