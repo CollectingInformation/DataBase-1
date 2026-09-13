@@ -1,0 +1,4566 @@
+// CS2AntiCheat - single-file v0.8
+// Visual Studio 2022 / x64 / C++17
+//
+// Runtime version: v0.1.0
+//
+// Memory integrity:
+// - PE section Characteristics: disk <-> memory
+// - DLL_FLAGS_MODIFIED detection
+// - RWX_SECTION detection
+// - executable section content integrity
+// - PRIVATE_EXECUTABLE detection
+// - explicit event flags
+//
+// config.json НЕ требуется.
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+#include <Windows.h>
+#include <TlHelp32.h>
+#include <Softpub.h>
+#include <Wincrypt.h>
+#include <Wintrust.h>
+#include <Winsock2.h>
+#include <Ws2tcpip.h>
+#include <Objbase.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cstring>
+#include <cwctype>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "Wintrust.lib")
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Ole32.lib")
+
+namespace fs = std::filesystem;
+
+// ============================================================
+// BUILT-IN CONFIG
+// ============================================================
+
+static constexpr const char* BUILTIN_SERVER_HOST =
+"188.255.58.122";
+
+static constexpr int BUILTIN_SERVER_PORT =
+50829;
+
+static constexpr const char* BUILTIN_AUTH_TOKEN =
+"CS2AC_2026_9F7K2M4P";
+
+// ============================================================
+// TYPES
+// ============================================================
+
+enum class SignatureState {
+    Valid,
+    Invalid,
+    Unknown
+};
+
+enum class HashState {
+    Valid,
+    Failed
+};
+
+struct Config {
+
+    std::wstring gameProcess = L"cs2.exe";
+
+    int scanIntervalMs = 2000;
+    int heartbeatIntervalMs = 5000;
+
+    std::string serverHost = BUILTIN_SERVER_HOST;
+    int serverPort = BUILTIN_SERVER_PORT;
+    std::string authToken = BUILTIN_AUTH_TOKEN;
+
+    bool showOverlay = true;
+    int overlaySeconds = 5;
+
+    bool requireAcStartedBeforeGame = true;
+    bool reportUnsignedProcesses = false;
+    bool monitorRegistry = true;
+
+    std::vector<std::wstring> allowedProcesses = {
+        L"cs2.exe",
+        L"steam.exe",
+        L"steamwebhelper.exe",
+        L"discord.exe",
+        L"obs64.exe",
+        L"explorer.exe",
+        L"svchost.exe",
+        L"RuntimeBroker.exe",
+        L"sihost.exe",
+        L"taskhostw.exe",
+        L"unsecapp.exe",
+        L"SecurityHealthSystray.exe",
+        L"conhost.exe",
+        L"ArmouryCrate.exe",
+        L"RZSurroundHelper.exe"
+    };
+
+    std::vector<std::wstring> suspiciousNames = {
+        L"cheatengine-x86_64.exe",
+        L"extremeinjector.exe",
+        L"cheat_loader.exe",
+        L"injector.exe",
+        L"kdmapper.exe",
+        L"processhacker.exe"
+    };
+
+    std::vector<std::wstring> trustedPathPrefixes = {
+        LR"(c:\windows\system32\)",
+        LR"(c:\windows\syswow64\)",
+        LR"(c:\windows\systemapps\)",
+        LR"(c:\program files\windowsapps\)"
+    };
+};
+
+struct CachedFile {
+
+    std::string sha256;
+
+    HashState hashState =
+        HashState::Failed;
+
+    SignatureState signature =
+        SignatureState::Unknown;
+
+    uintmax_t size = 0;
+
+    fs::file_time_type writeTime{};
+};
+
+struct ProcInfo {
+
+    DWORD pid = 0;
+    DWORD parentPid = 0;
+
+    std::wstring name;
+    std::wstring path;
+
+    std::string sha256;
+
+    HashState hashState =
+        HashState::Failed;
+
+    SignatureState signature =
+        SignatureState::Unknown;
+};
+
+struct ModuleInfo {
+
+    DWORD pid = 0;
+
+    std::wstring name;
+    std::wstring path;
+
+    uintptr_t base = 0;
+    DWORD size = 0;
+};
+
+struct DllSectionFlags {
+
+    std::string name;
+
+    DWORD virtualAddress = 0;
+    DWORD virtualSize = 0;
+
+    DWORD characteristics = 0;
+};
+
+struct MemoryBaseline {
+
+    uintptr_t base = 0;
+    DWORD size = 0;
+
+    std::string modulePath;
+
+    struct Section {
+
+        uintptr_t address = 0;
+        DWORD size = 0;
+
+        std::string hash;
+
+        int changedCount = 0;
+    };
+
+    std::vector<Section> sections;
+};
+
+struct PrivateExecutableRegion {
+
+    uintptr_t address = 0;
+    SIZE_T size = 0;
+
+    DWORD allocationProtect = 0;
+    DWORD protect = 0;
+
+    DWORD type = 0;
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+static std::string WideToUtf8(
+    const std::wstring& s) {
+
+    if (s.empty())
+        return {};
+
+    int n =
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            s.data(),
+            (int)s.size(),
+            nullptr,
+            0,
+            nullptr,
+            nullptr
+        );
+
+    if (n <= 0)
+        return {};
+
+    std::string out(
+        n,
+        '\0'
+    );
+
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        s.data(),
+        n,
+        out.data(),
+        n,
+        nullptr,
+        nullptr
+    );
+
+    return out;
+}
+
+static std::wstring ToLowerW(
+    std::wstring s) {
+
+    std::transform(
+        s.begin(),
+        s.end(),
+        s.begin(),
+        [](wchar_t c) {
+            return (wchar_t)towlower(c);
+        }
+    );
+
+    return s;
+}
+
+static std::string JsonEscape(
+    const std::string& s) {
+
+    std::ostringstream o;
+
+    for (unsigned char c : s) {
+
+        switch (c) {
+
+        case '"':
+            o << "\\\"";
+            break;
+
+        case '\\':
+            o << "\\\\";
+            break;
+
+        case '\n':
+            o << "\\n";
+            break;
+
+        case '\r':
+            o << "\\r";
+            break;
+
+        case '\t':
+            o << "\\t";
+            break;
+
+        default:
+
+            if (c < 0x20) {
+
+                o
+                    << "\\u"
+                    << std::hex
+                    << std::setw(4)
+                    << std::setfill('0')
+                    << (int)c
+                    << std::dec;
+            }
+            else {
+
+                o << (char)c;
+            }
+
+            break;
+        }
+    }
+
+    return o.str();
+}
+
+static std::string JsonEscapeW(
+    const std::wstring& s) {
+
+    return JsonEscape(
+        WideToUtf8(s)
+    );
+}
+
+static std::string HexDword(
+    DWORD value) {
+
+    std::ostringstream oss;
+
+    oss
+        << "0x"
+        << std::hex
+        << std::uppercase
+        << value
+        << std::dec;
+
+    return oss.str();
+}
+
+static bool IsExecuteProtection(
+    DWORD protect) {
+
+    DWORD base =
+        protect &
+        0xFF;
+
+    return
+        base == PAGE_EXECUTE ||
+        base == PAGE_EXECUTE_READ ||
+        base == PAGE_EXECUTE_READWRITE ||
+        base == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool IsWriteProtection(
+    DWORD protect) {
+
+    DWORD base =
+        protect &
+        0xFF;
+
+    return
+        base == PAGE_READWRITE ||
+        base == PAGE_WRITECOPY ||
+        base == PAGE_EXECUTE_READWRITE ||
+        base == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool IsReadProtection(
+    DWORD protect) {
+
+    DWORD base =
+        protect &
+        0xFF;
+
+    return
+        base == PAGE_READONLY ||
+        base == PAGE_READWRITE ||
+        base == PAGE_WRITECOPY ||
+        base == PAGE_EXECUTE_READ ||
+        base == PAGE_EXECUTE_READWRITE ||
+        base == PAGE_EXECUTE_WRITECOPY;
+}
+
+// ============================================================
+// LOGGER
+// ============================================================
+
+class Logger {
+
+public:
+
+    explicit Logger(
+        const fs::path& path)
+        : path_(path) {
+    }
+
+    void Info(
+        const std::string& msg) {
+
+        Write(
+            "INFO",
+            msg
+        );
+    }
+
+    void Warn(
+        const std::string& msg) {
+
+        Write(
+            "WARN",
+            msg
+        );
+    }
+
+    void Error(
+        const std::string& msg) {
+
+        Write(
+            "ERROR",
+            msg
+        );
+    }
+
+private:
+
+    void Write(
+        const char* level,
+        const std::string& msg) {
+
+        std::lock_guard<std::mutex> lock(
+            mu_
+        );
+
+        std::ofstream f(
+            path_,
+            std::ios::app
+        );
+
+        auto now =
+            std::chrono::system_clock::to_time_t(
+                std::chrono::system_clock::now()
+            );
+
+        std::tm tm{};
+
+        localtime_s(
+            &tm,
+            &now
+        );
+
+        if (f) {
+
+            f
+                << std::put_time(
+                    &tm,
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                << " ["
+                << level
+                << "] "
+                << msg
+                << "\n";
+        }
+
+        std::cout
+            << "["
+            << level
+            << "] "
+            << msg
+            << "\n";
+    }
+
+    fs::path path_;
+    std::mutex mu_;
+};
+
+// ============================================================
+// SHA256 FILE
+// ============================================================
+
+static std::string Sha256File(
+    const fs::path& path) {
+
+    HANDLE hFile =
+        CreateFileW(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ |
+            FILE_SHARE_WRITE |
+            FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+
+    if (
+        hFile ==
+        INVALID_HANDLE_VALUE) {
+
+        return {};
+    }
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+
+    if (!CryptAcquireContextW(
+        &hProv,
+        nullptr,
+        nullptr,
+        PROV_RSA_AES,
+        CRYPT_VERIFYCONTEXT)) {
+
+        CloseHandle(hFile);
+        return {};
+    }
+
+    if (!CryptCreateHash(
+        hProv,
+        CALG_SHA_256,
+        0,
+        0,
+        &hHash)) {
+
+        CryptReleaseContext(
+            hProv,
+            0
+        );
+
+        CloseHandle(hFile);
+        return {};
+    }
+
+    std::vector<BYTE> buffer(
+        1024 * 1024
+    );
+
+    DWORD bytesRead = 0;
+
+    bool ok = true;
+
+    while (
+        ReadFile(
+            hFile,
+            buffer.data(),
+            (DWORD)buffer.size(),
+            &bytesRead,
+            nullptr
+        ) &&
+        bytesRead > 0) {
+
+        if (!CryptHashData(
+            hHash,
+            buffer.data(),
+            bytesRead,
+            0)) {
+
+            ok = false;
+            break;
+        }
+    }
+
+    std::string result;
+
+    if (ok) {
+
+        BYTE hash[32]{};
+
+        DWORD hashLen =
+            sizeof(hash);
+
+        if (CryptGetHashParam(
+            hHash,
+            HP_HASHVAL,
+            hash,
+            &hashLen,
+            0)) {
+
+            std::ostringstream oss;
+
+            for (
+                DWORD i = 0;
+                i < hashLen;
+                ++i) {
+
+                oss
+                    << std::hex
+                    << std::setw(2)
+                    << std::setfill('0')
+                    << (int)hash[i];
+            }
+
+            result =
+                oss.str();
+        }
+    }
+
+    CryptDestroyHash(hHash);
+
+    CryptReleaseContext(
+        hProv,
+        0
+    );
+
+    CloseHandle(hFile);
+
+    return result;
+}
+
+// ============================================================
+// SHA256 MEMORY BUFFER
+// ============================================================
+
+static std::string Sha256Buffer(
+    const BYTE* data,
+    size_t size) {
+
+    if (!data || size == 0)
+        return {};
+
+    if (
+        size >
+        static_cast<size_t>(
+            std::numeric_limits<DWORD>::max()
+            )) {
+
+        return {};
+    }
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+
+    if (!CryptAcquireContextW(
+        &hProv,
+        nullptr,
+        nullptr,
+        PROV_RSA_AES,
+        CRYPT_VERIFYCONTEXT)) {
+
+        return {};
+    }
+
+    if (!CryptCreateHash(
+        hProv,
+        CALG_SHA_256,
+        0,
+        0,
+        &hHash)) {
+
+        CryptReleaseContext(
+            hProv,
+            0
+        );
+
+        return {};
+    }
+
+    bool ok =
+        CryptHashData(
+            hHash,
+            data,
+            static_cast<DWORD>(size),
+            0
+        ) != FALSE;
+
+    std::string result;
+
+    if (ok) {
+
+        BYTE hash[32]{};
+
+        DWORD hashLen =
+            sizeof(hash);
+
+        if (CryptGetHashParam(
+            hHash,
+            HP_HASHVAL,
+            hash,
+            &hashLen,
+            0)) {
+
+            std::ostringstream oss;
+
+            for (
+                DWORD i = 0;
+                i < hashLen;
+                ++i) {
+
+                oss
+                    << std::hex
+                    << std::setw(2)
+                    << std::setfill('0')
+                    << (int)hash[i];
+            }
+
+            result =
+                oss.str();
+        }
+    }
+
+    CryptDestroyHash(hHash);
+
+    CryptReleaseContext(
+        hProv,
+        0
+    );
+
+    return result;
+}
+
+// ============================================================
+// SIGNATURE
+// ============================================================
+
+static SignatureState CheckSignature(
+    const fs::path& path) {
+
+    WINTRUST_FILE_INFO fi{};
+
+    fi.cbStruct =
+        sizeof(fi);
+
+    fi.pcwszFilePath =
+        path.c_str();
+
+    GUID policy =
+        WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    WINTRUST_DATA wd{};
+
+    wd.cbStruct =
+        sizeof(wd);
+
+    wd.dwUIChoice =
+        WTD_UI_NONE;
+
+    wd.fdwRevocationChecks =
+        WTD_REVOKE_NONE;
+
+    wd.dwUnionChoice =
+        WTD_CHOICE_FILE;
+
+    wd.pFile =
+        &fi;
+
+    wd.dwStateAction =
+        WTD_STATEACTION_IGNORE;
+
+    wd.dwProvFlags =
+        WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    LONG status =
+        WinVerifyTrust(
+            nullptr,
+            &policy,
+            &wd
+        );
+
+    if (
+        status ==
+        ERROR_SUCCESS) {
+
+        return SignatureState::Valid;
+    }
+
+    if (
+        status ==
+        TRUST_E_NOSIGNATURE ||
+        status ==
+        TRUST_E_SUBJECT_FORM_UNKNOWN ||
+        status ==
+        TRUST_E_PROVIDER_UNKNOWN) {
+
+        return SignatureState::Invalid;
+    }
+
+    return SignatureState::Unknown;
+}
+
+// ============================================================
+// PROCESS HELPERS
+// ============================================================
+
+static std::wstring QueryProcessPath(
+    HANDLE hProcess) {
+
+    wchar_t path[32768]{};
+
+    DWORD size =
+        (DWORD)std::size(path);
+
+    if (
+        QueryFullProcessImageNameW(
+            hProcess,
+            0,
+            path,
+            &size)) {
+
+        return std::wstring(
+            path,
+            size
+        );
+    }
+
+    return {};
+}
+
+static DWORD FindProcessPid(
+    const std::wstring& name) {
+
+    HANDLE snap =
+        CreateToolhelp32Snapshot(
+            TH32CS_SNAPPROCESS,
+            0
+        );
+
+    if (
+        snap ==
+        INVALID_HANDLE_VALUE) {
+
+        return 0;
+    }
+
+    PROCESSENTRY32W pe{};
+
+    pe.dwSize =
+        sizeof(pe);
+
+    DWORD result = 0;
+
+    std::wstring wanted =
+        ToLowerW(name);
+
+    if (
+        Process32FirstW(
+            snap,
+            &pe)) {
+
+        do {
+
+            if (
+                ToLowerW(
+                    pe.szExeFile
+                ) ==
+                wanted) {
+
+                result =
+                    pe.th32ProcessID;
+
+                break;
+            }
+
+        } while (
+            Process32NextW(
+                snap,
+                &pe
+            )
+            );
+    }
+
+    CloseHandle(snap);
+
+    return result;
+}
+
+static bool GetProcessBasicInfo(
+    DWORD pid,
+    std::wstring& name,
+    std::wstring& path,
+    DWORD& parentPid) {
+
+    name.clear();
+    path.clear();
+    parentPid = 0;
+
+    HANDLE snap =
+        CreateToolhelp32Snapshot(
+            TH32CS_SNAPPROCESS,
+            0
+        );
+
+    if (
+        snap ==
+        INVALID_HANDLE_VALUE) {
+
+        return false;
+    }
+
+    PROCESSENTRY32W pe{};
+
+    pe.dwSize =
+        sizeof(pe);
+
+    bool found = false;
+
+    if (
+        Process32FirstW(
+            snap,
+            &pe)) {
+
+        do {
+
+            if (
+                pe.th32ProcessID ==
+                pid) {
+
+                name =
+                    pe.szExeFile;
+
+                parentPid =
+                    pe.th32ParentProcessID;
+
+                found = true;
+
+                break;
+            }
+
+        } while (
+            Process32NextW(
+                snap,
+                &pe
+            )
+            );
+    }
+
+    CloseHandle(snap);
+
+    if (!found)
+        return false;
+
+    HANDLE process =
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            pid
+        );
+
+    if (process) {
+
+        path =
+            QueryProcessPath(
+                process
+            );
+
+        CloseHandle(process);
+    }
+
+    return true;
+}
+
+// ============================================================
+// LAUNCH CHAIN
+// ============================================================
+
+static std::vector<ProcInfo>
+BuildLaunchChain(
+    DWORD pid) {
+
+    std::vector<ProcInfo> chain;
+
+    std::unordered_set<DWORD>
+        visited;
+
+    DWORD current =
+        pid;
+
+    for (
+        int i = 0;
+        i < 12 &&
+        current != 0;
+        ++i) {
+
+        if (
+            visited.count(
+                current
+            )) {
+
+            break;
+        }
+
+        visited.insert(
+            current
+        );
+
+        ProcInfo info;
+
+        info.pid =
+            current;
+
+        if (
+            !GetProcessBasicInfo(
+                current,
+                info.name,
+                info.path,
+                info.parentPid
+            )) {
+
+            break;
+        }
+
+        DWORD parentPid =
+            info.parentPid;
+
+        chain.push_back(
+            std::move(info)
+        );
+
+        if (
+            parentPid == 0 ||
+            parentPid == current) {
+
+            break;
+        }
+
+        current =
+            parentPid;
+    }
+
+    return chain;
+}
+
+// ============================================================
+// MODULE ENUMERATION
+// ============================================================
+
+static std::vector<ModuleInfo>
+EnumerateModules(
+    DWORD pid) {
+
+    std::vector<ModuleInfo>
+        result;
+
+    HANDLE snap =
+        CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE |
+            TH32CS_SNAPMODULE32,
+            pid
+        );
+
+    if (
+        snap ==
+        INVALID_HANDLE_VALUE) {
+
+        return result;
+    }
+
+    MODULEENTRY32W me{};
+
+    me.dwSize =
+        sizeof(me);
+
+    if (
+        Module32FirstW(
+            snap,
+            &me)) {
+
+        do {
+
+            ModuleInfo info;
+
+            info.pid =
+                pid;
+
+            info.name =
+                me.szModule;
+
+            info.path =
+                me.szExePath;
+
+            info.base =
+                reinterpret_cast<uintptr_t>(
+                    me.modBaseAddr
+                    );
+
+            info.size =
+                me.modBaseSize;
+
+            result.push_back(
+                std::move(info)
+            );
+
+        } while (
+            Module32NextW(
+                snap,
+                &me
+            )
+            );
+    }
+
+    CloseHandle(snap);
+
+    return result;
+}
+
+// ============================================================
+// OVERLAY
+// ============================================================
+
+static HFONT gOverlayFont =
+nullptr;
+
+static LRESULT CALLBACK OverlayWndProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam) {
+
+    switch (msg) {
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+
+        PAINTSTRUCT ps{};
+
+        HDC hdc =
+            BeginPaint(
+                hwnd,
+                &ps
+            );
+
+        RECT rc{};
+
+        GetClientRect(
+            hwnd,
+            &rc
+        );
+
+        HBRUSH bg =
+            CreateSolidBrush(
+                RGB(
+                    25,
+                    25,
+                    25
+                )
+            );
+
+        FillRect(
+            hdc,
+            &rc,
+            bg
+        );
+
+        DeleteObject(bg);
+
+        SetBkMode(
+            hdc,
+            TRANSPARENT
+        );
+
+        SetTextColor(
+            hdc,
+            RGB(
+                240,
+                240,
+                240
+            )
+        );
+
+        if (gOverlayFont)
+            SelectObject(
+                hdc,
+                gOverlayFont
+            );
+
+        DrawTextW(
+            hdc,
+            L"ENABLE AC",
+            -1,
+            &rc,
+            DT_CENTER |
+            DT_VCENTER |
+            DT_SINGLELINE
+        );
+
+        EndPaint(
+            hwnd,
+            &ps
+        );
+
+        return 0;
+    }
+
+    default:
+
+        return DefWindowProcW(
+            hwnd,
+            msg,
+            wParam,
+            lParam
+        );
+    }
+}
+
+static void ShowOverlayForSeconds(
+    int seconds) {
+
+    if (seconds <= 0)
+        return;
+
+    const wchar_t* cls =
+        L"CS2_AC_OVERLAY_V04";
+
+    HINSTANCE instance =
+        GetModuleHandleW(
+            nullptr
+        );
+
+    WNDCLASSW wc{};
+
+    wc.lpfnWndProc =
+        OverlayWndProc;
+
+    wc.hInstance =
+        instance;
+
+    wc.lpszClassName =
+        cls;
+
+    RegisterClassW(&wc);
+
+    gOverlayFont =
+        CreateFontW(
+            28,
+            0,
+            0,
+            0,
+            FW_SEMIBOLD,
+            FALSE,
+            FALSE,
+            FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH |
+            FF_DONTCARE,
+            L"Segoe UI"
+        );
+
+    const int width =
+        240;
+
+    const int height =
+        64;
+
+    const int x =
+        GetSystemMetrics(
+            SM_CXSCREEN
+        ) -
+        width -
+        25;
+
+    const int y =
+        30;
+
+    HWND hwnd =
+        CreateWindowExW(
+            WS_EX_LAYERED |
+            WS_EX_TRANSPARENT |
+            WS_EX_TOPMOST |
+            WS_EX_NOACTIVATE,
+            cls,
+            L"",
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            nullptr,
+            nullptr,
+            instance,
+            nullptr
+        );
+
+    if (!hwnd) {
+
+        if (gOverlayFont) {
+
+            DeleteObject(
+                gOverlayFont
+            );
+
+            gOverlayFont =
+                nullptr;
+        }
+
+        UnregisterClassW(
+            cls,
+            instance
+        );
+
+        return;
+    }
+
+    SetLayeredWindowAttributes(
+        hwnd,
+        0,
+        225,
+        LWA_ALPHA
+    );
+
+    ShowWindow(
+        hwnd,
+        SW_SHOWNOACTIVATE
+    );
+
+    UpdateWindow(hwnd);
+
+    auto until =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(
+            seconds
+        );
+
+    MSG msg{};
+
+    while (
+        std::chrono::steady_clock::now() <
+        until) {
+
+        while (
+            PeekMessageW(
+                &msg,
+                nullptr,
+                0,
+                0,
+                PM_REMOVE)) {
+
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(
+                25
+            )
+        );
+    }
+
+    DestroyWindow(hwnd);
+
+    if (gOverlayFont) {
+
+        DeleteObject(
+            gOverlayFont
+        );
+
+        gOverlayFont =
+            nullptr;
+    }
+
+    UnregisterClassW(
+        cls,
+        instance
+    );
+}
+
+// ============================================================
+// REPORTER
+// ============================================================
+
+class Reporter {
+
+public:
+
+    Reporter(
+        const Config& cfg,
+        Logger& logger)
+        : cfg_(cfg),
+        logger_(logger) {
+
+        int result =
+            WSAStartup(
+                MAKEWORD(2, 2),
+                &wsa_
+            );
+
+        if (result != 0) {
+
+            logger_.Error(
+                "WSAStartup failed: " +
+                std::to_string(result)
+            );
+
+            wsaReady_ =
+                false;
+        }
+        else {
+
+            wsaReady_ =
+                true;
+        }
+    }
+
+    ~Reporter() {
+
+        if (wsaReady_)
+            WSACleanup();
+    }
+
+    void SendEvent(
+        const std::string& event,
+        const std::string& session,
+        const std::string& detail,
+        const std::string& flags = "") {
+
+        std::ostringstream json;
+
+        json
+            << "{\"auth_token\":\""
+            << JsonEscape(
+                cfg_.authToken
+            )
+            << "\",\"event\":\""
+            << JsonEscape(
+                event
+            )
+            << "\",\"session_id\":\""
+            << JsonEscape(
+                session
+            )
+            << "\",\"flags\":\""
+            << JsonEscape(
+                flags
+            )
+            << "\",\"detail\":\""
+            << JsonEscape(
+                detail
+            )
+            << "\"}";
+
+        logger_.Info(
+            "EVENT " +
+            event +
+            " session=" +
+            session +
+            (
+                flags.empty()
+                ? ""
+                : " flags=" + flags
+                )
+        );
+
+        SendRaw(
+            json.str()
+        );
+    }
+
+private:
+
+    bool SendRaw(
+        const std::string& payload) {
+
+        if (!wsaReady_) {
+
+            logger_.Warn(
+                "Reporter: Winsock is not ready"
+            );
+
+            return false;
+        }
+
+        if (
+            cfg_.serverHost.empty() ||
+            cfg_.serverPort < 1 ||
+            cfg_.serverPort > 65535) {
+
+            logger_.Warn(
+                "Reporter: invalid server configuration"
+            );
+
+            return false;
+        }
+
+        addrinfo hints{};
+
+        hints.ai_family =
+            AF_UNSPEC;
+
+        hints.ai_socktype =
+            SOCK_STREAM;
+
+        hints.ai_protocol =
+            IPPROTO_TCP;
+
+        addrinfo* result =
+            nullptr;
+
+        std::string port =
+            std::to_string(
+                cfg_.serverPort
+            );
+
+        int rc =
+            getaddrinfo(
+                cfg_.serverHost.c_str(),
+                port.c_str(),
+                &hints,
+                &result
+            );
+
+        if (
+            rc != 0 ||
+            !result) {
+
+            logger_.Warn(
+                "Reporter: getaddrinfo failed: " +
+                std::to_string(rc)
+            );
+
+            return false;
+        }
+
+        bool sent =
+            false;
+
+        std::string wirePayload =
+            payload + "\n";
+
+        for (
+            addrinfo* ai = result;
+            ai != nullptr;
+            ai = ai->ai_next) {
+
+            SOCKET sock =
+                socket(
+                    ai->ai_family,
+                    ai->ai_socktype,
+                    ai->ai_protocol
+                );
+
+            if (
+                sock ==
+                INVALID_SOCKET) {
+
+                continue;
+            }
+
+            DWORD timeout =
+                2000;
+
+            setsockopt(
+                sock,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                (const char*)&timeout,
+                sizeof(timeout)
+            );
+
+            setsockopt(
+                sock,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                (const char*)&timeout,
+                sizeof(timeout)
+            );
+
+            if (
+                connect(
+                    sock,
+                    ai->ai_addr,
+                    (int)ai->ai_addrlen
+                ) ==
+                SOCKET_ERROR) {
+
+                int err =
+                    WSAGetLastError();
+
+                logger_.Warn(
+                    "Reporter: connect failed, WSA=" +
+                    std::to_string(err)
+                );
+
+                closesocket(sock);
+
+                continue;
+            }
+
+            size_t total =
+                0;
+
+            while (
+                total <
+                wirePayload.size()) {
+
+                int chunk =
+                    (int)std::min<size_t>(
+                        wirePayload.size() -
+                        total,
+                        64 * 1024
+                    );
+
+                int n =
+                    send(
+                        sock,
+                        wirePayload.data() +
+                        total,
+                        chunk,
+                        0
+                    );
+
+                if (
+                    n ==
+                    SOCKET_ERROR ||
+                    n <= 0) {
+
+                    logger_.Warn(
+                        "Reporter: send failed, WSA=" +
+                        std::to_string(
+                            WSAGetLastError()
+                        )
+                    );
+
+                    break;
+                }
+
+                total +=
+                    (size_t)n;
+            }
+
+            if (
+                total ==
+                wirePayload.size()) {
+
+                char response[32]{};
+
+                int received =
+                    recv(
+                        sock,
+                        response,
+                        sizeof(response) - 1,
+                        0
+                    );
+
+                if (received > 0) {
+
+                    response[received] =
+                        '\0';
+
+                    std::string reply =
+                        response;
+
+                    while (
+                        !reply.empty() &&
+                        (
+                            reply.back() == '\r' ||
+                            reply.back() == '\n' ||
+                            reply.back() == ' ' ||
+                            reply.back() == '\t'
+                            )) {
+
+                        reply.pop_back();
+                    }
+
+                    if (reply == "OK") {
+
+                        sent =
+                            true;
+                    }
+                    else {
+
+                        logger_.Warn(
+                            "Reporter: server reply: " +
+                            reply
+                        );
+                    }
+                }
+                else {
+
+                    logger_.Warn(
+                        "Reporter: no server response"
+                    );
+                }
+            }
+
+            shutdown(
+                sock,
+                SD_BOTH
+            );
+
+            closesocket(sock);
+
+            if (sent)
+                break;
+        }
+
+        freeaddrinfo(result);
+
+        if (!sent) {
+
+            logger_.Warn(
+                "Reporter: unable to send event"
+            );
+        }
+
+        return sent;
+    }
+
+    const Config& cfg_;
+    Logger& logger_;
+
+    WSADATA wsa_{};
+
+    bool wsaReady_ =
+        false;
+};
+
+// ============================================================
+// ANTICHEAT
+// ============================================================
+
+class AntiCheat {
+
+public:
+
+    AntiCheat(
+        Config cfg,
+        Logger& logger,
+        Reporter& reporter)
+        : cfg_(std::move(cfg)),
+        logger_(logger),
+        reporter_(reporter) {
+
+        sessionId_ =
+            MakeSessionId();
+
+        stopEvent_ =
+            CreateEventW(
+                nullptr,
+                TRUE,
+                FALSE,
+                nullptr
+            );
+    }
+
+    ~AntiCheat() {
+
+        stop_ =
+            true;
+
+        if (stopEvent_) {
+
+            SetEvent(
+                stopEvent_
+            );
+
+            CloseHandle(
+                stopEvent_
+            );
+
+            stopEvent_ =
+                nullptr;
+        }
+    }
+
+    void Run() {
+
+        logger_.Info(
+            "CS2 AntiCheat v0.1.0"
+        );
+
+        logger_.Info(
+            "session=" +
+            sessionId_
+        );
+
+        reporter_.SendEvent(
+            "session_start",
+            sessionId_,
+            "client_started"
+        );
+
+        DWORD existing =
+            FindGamePid();
+
+        if (
+            existing != 0 &&
+            cfg_.requireAcStartedBeforeGame) {
+
+            std::string detail =
+                "reason=game_started_before_anticheat;pid=" +
+                std::to_string(
+                    existing
+                );
+
+            logger_.Warn(
+                detail
+            );
+
+            reporter_.SendEvent(
+                "game_started_before_anticheat",
+                sessionId_,
+                detail,
+                "GAME_STARTED_BEFORE_AC"
+            );
+        }
+
+        if (cfg_.showOverlay) {
+
+            ShowOverlayForSeconds(
+                cfg_.overlaySeconds
+            );
+        }
+
+        std::thread scanner(
+            &AntiCheat::ScannerLoop,
+            this
+        );
+
+        std::thread heartbeat(
+            &AntiCheat::HeartbeatLoop,
+            this
+        );
+
+        std::thread watchdog(
+            &AntiCheat::WatchdogLoop,
+            this
+        );
+
+        std::thread registry;
+
+        if (cfg_.monitorRegistry) {
+
+            registry =
+                std::thread(
+                    &AntiCheat::RegistryLoop,
+                    this
+                );
+        }
+
+        scanner.join();
+        heartbeat.join();
+        watchdog.join();
+
+        if (registry.joinable())
+            registry.join();
+    }
+
+private:
+
+    // ========================================================
+    // SESSION
+    // ========================================================
+
+    std::string MakeSessionId() {
+
+        GUID guid{};
+
+        if (
+            FAILED(
+                CoCreateGuid(
+                    &guid
+                )
+            )) {
+
+            return "session-" +
+                std::to_string(
+                    GetTickCount64()
+                );
+        }
+
+        wchar_t buffer[64]{};
+
+        if (
+            StringFromGUID2(
+                guid,
+                buffer,
+                64
+            ) <= 0) {
+
+            return "session-" +
+                std::to_string(
+                    GetTickCount64()
+                );
+        }
+
+        std::wstring value(
+            buffer
+        );
+
+        value.erase(
+            std::remove(
+                value.begin(),
+                value.end(),
+                L'{'
+            ),
+            value.end()
+        );
+
+        value.erase(
+            std::remove(
+                value.begin(),
+                value.end(),
+                L'}'
+            ),
+            value.end()
+        );
+
+        return WideToUtf8(
+            value
+        );
+    }
+
+    DWORD FindGamePid() const {
+
+        return FindProcessPid(
+            cfg_.gameProcess
+        );
+    }
+
+    // ========================================================
+    // PROCESS RULES
+    // ========================================================
+
+    bool IsAllowed(
+        const std::wstring& name) const {
+
+        const auto n =
+            ToLowerW(name);
+
+        for (
+            const auto& allowed :
+            cfg_.allowedProcesses) {
+
+            if (
+                n ==
+                ToLowerW(
+                    allowed
+                )) {
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool IsSuspiciousName(
+        const std::wstring& name) const {
+
+        const auto n =
+            ToLowerW(name);
+
+        for (
+            const auto& bad :
+            cfg_.suspiciousNames) {
+
+            if (
+                n ==
+                ToLowerW(
+                    bad
+                )) {
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool IsTrustedSystemPath(
+        const std::wstring& path) const {
+
+        const auto p =
+            ToLowerW(path);
+
+        for (
+            const auto& prefix :
+            cfg_.trustedPathPrefixes) {
+
+            if (
+                p.rfind(
+                    ToLowerW(prefix),
+                    0
+                ) == 0) {
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool IsTrustedModulePath(
+        const std::wstring& path) const {
+
+        const auto p =
+            ToLowerW(path);
+
+        for (
+            const auto& prefix :
+            cfg_.trustedPathPrefixes) {
+
+            if (
+                p.rfind(
+                    ToLowerW(prefix),
+                    0
+                ) == 0) {
+
+                return true;
+            }
+        }
+
+        static const std::vector<std::wstring>
+            extraTrusted = {
+
+                LR"(c:\windows\winsxs\)",
+                LR"(c:\windows\servicing\)",
+                LR"(c:\windows\systemresources\)"
+        };
+
+        for (
+            const auto& prefix :
+            extraTrusted) {
+
+            if (
+                p.rfind(
+                    prefix,
+                    0
+                ) == 0) {
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ========================================================
+    // FILE EVIDENCE
+    // ========================================================
+
+    CachedFile GetFileEvidence(
+        const fs::path& path) {
+
+        std::error_code ec;
+
+        auto size =
+            fs::file_size(
+                path,
+                ec
+            );
+
+        if (ec)
+            return {};
+
+        auto writeTime =
+            fs::last_write_time(
+                path,
+                ec
+            );
+
+        if (ec)
+            return {};
+
+        const auto key =
+            ToLowerW(
+                path.wstring()
+            );
+
+        {
+            std::lock_guard<std::mutex> lock(
+                cacheMutex_
+            );
+
+            auto it =
+                fileCache_.find(
+                    key
+                );
+
+            if (
+                it !=
+                fileCache_.end() &&
+                it->second.size ==
+                size &&
+                it->second.writeTime ==
+                writeTime) {
+
+                return it->second;
+            }
+        }
+
+        CachedFile evidence;
+
+        evidence.size =
+            size;
+
+        evidence.writeTime =
+            writeTime;
+
+        evidence.sha256 =
+            Sha256File(
+                path
+            );
+
+        evidence.hashState =
+            evidence.sha256.empty()
+            ? HashState::Failed
+            : HashState::Valid;
+
+        evidence.signature =
+            CheckSignature(
+                path
+            );
+
+        {
+            std::lock_guard<std::mutex> lock(
+                cacheMutex_
+            );
+
+            fileCache_[key] =
+                evidence;
+        }
+
+        return evidence;
+    }
+
+    int CalculateRisk(
+        const ProcInfo& p,
+        std::string& reason) const {
+
+        int score =
+            0;
+
+        bool suspicious =
+            IsSuspiciousName(
+                p.name
+            );
+
+        bool allowed =
+            IsAllowed(
+                p.name
+            );
+
+        bool systemPath =
+            IsTrustedSystemPath(
+                p.path
+            );
+
+        if (suspicious) {
+
+            score += 80;
+
+            reason +=
+                "known_suspicious_name;";
+        }
+
+        if (
+            p.signature ==
+            SignatureState::Invalid &&
+            !systemPath) {
+
+            score += 15;
+
+            reason +=
+                "invalid_signature;";
+        }
+
+        if (
+            p.signature ==
+            SignatureState::Unknown) {
+
+            reason +=
+                "signature_unknown;";
+        }
+
+        if (
+            p.hashState ==
+            HashState::Failed) {
+
+            reason +=
+                "hash_unavailable;";
+        }
+
+        if (
+            !allowed &&
+            !systemPath &&
+            p.signature ==
+            SignatureState::Invalid) {
+
+            score += 10;
+
+            reason +=
+                "unknown_unsigned_non_system;";
+        }
+
+        if (
+            systemPath &&
+            score < 50) {
+
+            score =
+                std::min(
+                    score,
+                    10
+                );
+
+            reason +=
+                "trusted_system_path;";
+        }
+
+        if (score == 0)
+            reason =
+            "low_signal;";
+
+        return score;
+    }
+
+    // ========================================================
+    // PROCESS ENUMERATION
+    // ========================================================
+
+    std::vector<ProcInfo>
+        EnumerateProcesses() {
+
+        std::vector<ProcInfo> result;
+
+        HANDLE snap =
+            CreateToolhelp32Snapshot(
+                TH32CS_SNAPPROCESS,
+                0
+            );
+
+        if (
+            snap ==
+            INVALID_HANDLE_VALUE) {
+
+            return result;
+        }
+
+        PROCESSENTRY32W pe{};
+
+        pe.dwSize =
+            sizeof(pe);
+
+        if (
+            Process32FirstW(
+                snap,
+                &pe)) {
+
+            do {
+
+                if (
+                    pe.th32ProcessID ==
+                    0) {
+
+                    continue;
+                }
+
+                HANDLE process =
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION,
+                        FALSE,
+                        pe.th32ProcessID
+                    );
+
+                if (!process)
+                    continue;
+
+                ProcInfo info;
+
+                info.pid =
+                    pe.th32ProcessID;
+
+                info.parentPid =
+                    pe.th32ParentProcessID;
+
+                info.name =
+                    pe.szExeFile;
+
+                info.path =
+                    QueryProcessPath(
+                        process
+                    );
+
+                CloseHandle(
+                    process
+                );
+
+                if (
+                    !info.path.empty()) {
+
+                    auto evidence =
+                        GetFileEvidence(
+                            info.path
+                        );
+
+                    info.sha256 =
+                        evidence.sha256;
+
+                    info.hashState =
+                        evidence.hashState;
+
+                    info.signature =
+                        evidence.signature;
+                }
+
+                result.push_back(
+                    std::move(info)
+                );
+
+            } while (
+                Process32NextW(
+                    snap,
+                    &pe
+                )
+                );
+        }
+
+        CloseHandle(snap);
+
+        return result;
+    }
+
+    // ========================================================
+    // LAUNCH CHAIN
+    // ========================================================
+
+    void ReportLaunchChain(
+        DWORD cs2Pid) {
+
+        auto chain =
+            BuildLaunchChain(
+                cs2Pid
+            );
+
+        if (chain.empty())
+            return;
+
+        std::ostringstream detail;
+
+        detail
+            << "game=cs2.exe"
+            << ";pid="
+            << cs2Pid
+            << ";chain=";
+
+        for (
+            size_t i = 0;
+            i < chain.size();
+            ++i) {
+
+            if (i != 0)
+                detail << "<-";
+
+            detail
+                << WideToUtf8(
+                    chain[i].name
+                );
+        }
+
+        if (chain.size() > 1) {
+
+            const auto& parent =
+                chain[1];
+
+            detail
+                << ";parent_pid="
+                << parent.pid
+
+                << ";parent="
+                << WideToUtf8(
+                    parent.name
+                )
+
+                << ";parent_path="
+                << JsonEscapeW(
+                    parent.path
+                );
+        }
+
+        detail
+            << ";game_path="
+            << JsonEscapeW(
+                chain[0].path
+            );
+
+        logger_.Info(
+            "GAME LAUNCH CHAIN: " +
+            detail.str()
+        );
+
+        reporter_.SendEvent(
+            "game_launch_chain",
+            sessionId_,
+            detail.str()
+        );
+    }
+
+    // ========================================================
+    // MODULE SCAN
+    // ========================================================
+
+    void ScanGameModules(
+        DWORD pid) {
+
+        auto modules =
+            EnumerateModules(
+                pid
+            );
+
+        if (modules.empty())
+            return;
+
+        for (
+            const auto& module :
+            modules) {
+
+            if (
+                module.path.empty())
+                continue;
+
+            std::wstring modulePath =
+                ToLowerW(
+                    module.path
+                );
+
+            bool firstSeen =
+                false;
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    moduleMutex_
+                );
+
+                auto& known =
+                    knownModules_[pid];
+
+                if (
+                    !known.count(
+                        modulePath
+                    )) {
+
+                    known.insert(
+                        modulePath
+                    );
+
+                    firstSeen =
+                        true;
+                }
+            }
+
+            if (!firstSeen)
+                continue;
+
+            CachedFile evidence =
+                GetFileEvidence(
+                    module.path
+                );
+
+            bool trustedPath =
+                IsTrustedModulePath(
+                    module.path
+                );
+
+            int risk =
+                0;
+
+            std::string reason;
+
+            if (
+                evidence.signature ==
+                SignatureState::Invalid &&
+                !trustedPath) {
+
+                risk += 35;
+
+                reason +=
+                    "invalid_signature;";
+            }
+
+            if (
+                evidence.signature ==
+                SignatureState::Unknown) {
+
+                reason +=
+                    "signature_unknown;";
+            }
+
+            if (
+                evidence.hashState ==
+                HashState::Failed) {
+
+                reason +=
+                    "hash_unavailable;";
+            }
+
+            if (!trustedPath) {
+
+                reason +=
+                    "external_path;";
+            }
+
+            if (risk < 35)
+                continue;
+
+            std::string reportKey =
+                "module:" +
+                std::to_string(pid) +
+                ":" +
+                WideToUtf8(modulePath);
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    reportMutex_
+                );
+
+                if (
+                    !reported_.insert(
+                        reportKey
+                    ).second) {
+
+                    continue;
+                }
+            }
+
+            std::ostringstream detail;
+
+            detail
+                << "risk="
+                << risk
+
+                << ";pid="
+                << pid
+
+                << ";module="
+                << JsonEscapeW(
+                    module.name
+                )
+
+                << ";path="
+                << JsonEscapeW(
+                    module.path
+                )
+
+                << ";base=0x"
+                << std::hex
+                << std::uppercase
+                << module.base
+                << std::dec
+
+                << ";size="
+                << module.size
+
+                << ";signature=";
+
+            switch (
+                evidence.signature) {
+
+            case SignatureState::Valid:
+                detail << "valid";
+                break;
+
+            case SignatureState::Invalid:
+                detail << "invalid";
+                break;
+
+            default:
+                detail << "unknown";
+                break;
+            }
+
+            detail
+                << ";hash_state=";
+
+            if (
+                evidence.hashState ==
+                HashState::Valid) {
+
+                detail << "valid";
+
+            }
+            else {
+
+                detail << "unavailable";
+            }
+
+            detail
+                << ";sha256="
+                << evidence.sha256
+
+                << ";reason="
+                << reason;
+
+            logger_.Warn(
+                "MODULE ALERT: " +
+                detail.str()
+            );
+
+            reporter_.SendEvent(
+                "module_alert",
+                sessionId_,
+                detail.str(),
+                "MODULE_SUSPICIOUS"
+            );
+        }
+    }
+
+    // ========================================================
+    // PE SECTION FLAGS FROM DISK
+    // ========================================================
+
+    std::vector<DllSectionFlags>
+        ReadDiskSectionFlags(
+            const std::wstring& path) {
+
+        std::vector<DllSectionFlags>
+            result;
+
+        HANDLE file =
+            CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ |
+                FILE_SHARE_WRITE |
+                FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+
+        if (
+            file ==
+            INVALID_HANDLE_VALUE) {
+
+            return result;
+        }
+
+        IMAGE_DOS_HEADER dos{};
+
+        DWORD bytesRead = 0;
+
+        if (
+            !ReadFile(
+                file,
+                &dos,
+                sizeof(dos),
+                &bytesRead,
+                nullptr
+            ) ||
+            bytesRead != sizeof(dos) ||
+            dos.e_magic !=
+            IMAGE_DOS_SIGNATURE) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        if (
+            dos.e_lfanew <= 0 ||
+            dos.e_lfanew > 1024 * 1024) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        LARGE_INTEGER ntPos{};
+
+        ntPos.QuadPart =
+            dos.e_lfanew;
+
+        if (
+            !SetFilePointerEx(
+                file,
+                ntPos,
+                nullptr,
+                FILE_BEGIN
+            )) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        DWORD signature = 0;
+
+        if (
+            !ReadFile(
+                file,
+                &signature,
+                sizeof(signature),
+                &bytesRead,
+                nullptr
+            ) ||
+            bytesRead != sizeof(signature) ||
+            signature != IMAGE_NT_SIGNATURE) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        IMAGE_FILE_HEADER fileHeader{};
+
+        if (
+            !ReadFile(
+                file,
+                &fileHeader,
+                sizeof(fileHeader),
+                &bytesRead,
+                nullptr
+            ) ||
+            bytesRead != sizeof(fileHeader)) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        if (
+            fileHeader.NumberOfSections == 0 ||
+            fileHeader.NumberOfSections > 96 ||
+            fileHeader.SizeOfOptionalHeader == 0) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        std::vector<BYTE> optionalHeader(
+            fileHeader.SizeOfOptionalHeader
+        );
+
+        if (
+            !ReadFile(
+                file,
+                optionalHeader.data(),
+                static_cast<DWORD>(
+                    optionalHeader.size()
+                    ),
+                &bytesRead,
+                nullptr
+            ) ||
+            bytesRead != optionalHeader.size()) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        if (
+            optionalHeader.size() <
+            sizeof(WORD)) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        WORD magic =
+            *reinterpret_cast<const WORD*>(
+                optionalHeader.data()
+                );
+
+        if (
+            magic !=
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        std::vector<IMAGE_SECTION_HEADER>
+            sections(
+                fileHeader.NumberOfSections
+            );
+
+        DWORD sectionBytes =
+            static_cast<DWORD>(
+                sections.size() *
+                sizeof(IMAGE_SECTION_HEADER)
+                );
+
+        if (
+            !ReadFile(
+                file,
+                sections.data(),
+                sectionBytes,
+                &bytesRead,
+                nullptr
+            ) ||
+            bytesRead != sectionBytes) {
+
+            CloseHandle(file);
+            return result;
+        }
+
+        CloseHandle(file);
+
+        for (
+            const auto& section :
+            sections) {
+
+            DllSectionFlags info;
+
+            char nameBuffer[9]{};
+
+            memcpy(
+                nameBuffer,
+                section.Name,
+                8
+            );
+
+            info.name =
+                nameBuffer;
+
+            info.virtualAddress =
+                section.VirtualAddress;
+
+            info.virtualSize =
+                section.Misc.VirtualSize;
+
+            info.characteristics =
+                section.Characteristics;
+
+            result.push_back(
+                std::move(info)
+            );
+        }
+
+        return result;
+    }
+
+    // ========================================================
+    // PE SECTION FLAGS FROM MEMORY
+    // ========================================================
+
+    std::vector<DllSectionFlags>
+        ReadMemorySectionFlags(
+            HANDLE process,
+            const ModuleInfo& module) {
+
+        std::vector<DllSectionFlags>
+            result;
+
+        IMAGE_DOS_HEADER dos{};
+
+        SIZE_T bytesRead = 0;
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    module.base
+                    ),
+                &dos,
+                sizeof(dos),
+                &bytesRead
+            ) ||
+            bytesRead != sizeof(dos) ||
+            dos.e_magic !=
+            IMAGE_DOS_SIGNATURE) {
+
+            return result;
+        }
+
+        if (
+            dos.e_lfanew <= 0 ||
+            dos.e_lfanew > 1024 * 1024) {
+
+            return result;
+        }
+
+        uintptr_t ntAddress =
+            module.base +
+            static_cast<uintptr_t>(
+                dos.e_lfanew
+                );
+
+        DWORD signature = 0;
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    ntAddress
+                    ),
+                &signature,
+                sizeof(signature),
+                &bytesRead
+            ) ||
+            bytesRead != sizeof(signature) ||
+            signature != IMAGE_NT_SIGNATURE) {
+
+            return result;
+        }
+
+        IMAGE_FILE_HEADER fileHeader{};
+
+        uintptr_t fileHeaderAddress =
+            ntAddress +
+            sizeof(DWORD);
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    fileHeaderAddress
+                    ),
+                &fileHeader,
+                sizeof(fileHeader),
+                &bytesRead
+            ) ||
+            bytesRead != sizeof(fileHeader)) {
+
+            return result;
+        }
+
+        if (
+            fileHeader.NumberOfSections == 0 ||
+            fileHeader.NumberOfSections > 96) {
+
+            return result;
+        }
+
+        WORD magic = 0;
+
+        uintptr_t optionalAddress =
+            fileHeaderAddress +
+            sizeof(IMAGE_FILE_HEADER);
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    optionalAddress
+                    ),
+                &magic,
+                sizeof(magic),
+                &bytesRead
+            ) ||
+            bytesRead != sizeof(magic) ||
+            magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+
+            return result;
+        }
+
+        uintptr_t sectionAddress =
+            optionalAddress +
+            fileHeader.SizeOfOptionalHeader;
+
+        std::vector<IMAGE_SECTION_HEADER>
+            sections(
+                fileHeader.NumberOfSections
+            );
+
+        SIZE_T sectionBytes =
+            sections.size() *
+            sizeof(IMAGE_SECTION_HEADER);
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    sectionAddress
+                    ),
+                sections.data(),
+                sectionBytes,
+                &bytesRead
+            ) ||
+            bytesRead != sectionBytes) {
+
+            return result;
+        }
+
+        for (
+            const auto& section :
+            sections) {
+
+            DllSectionFlags info;
+
+            char nameBuffer[9]{};
+
+            memcpy(
+                nameBuffer,
+                section.Name,
+                8
+            );
+
+            info.name =
+                nameBuffer;
+
+            info.virtualAddress =
+                section.VirtualAddress;
+
+            info.virtualSize =
+                section.Misc.VirtualSize;
+
+            info.characteristics =
+                section.Characteristics;
+
+            result.push_back(
+                std::move(info)
+            );
+        }
+
+        return result;
+    }
+
+    // ========================================================
+    // DLL FLAG INTEGRITY
+    // ========================================================
+
+    void ScanDllSectionFlags(
+        HANDLE process,
+        DWORD pid,
+        const ModuleInfo& module) {
+
+        auto diskSections =
+            ReadDiskSectionFlags(
+                module.path
+            );
+
+        if (diskSections.empty())
+            return;
+
+        auto memorySections =
+            ReadMemorySectionFlags(
+                process,
+                module
+            );
+
+        if (memorySections.empty())
+            return;
+
+        for (
+            const auto& memorySection :
+            memorySections) {
+
+            auto diskIt =
+                std::find_if(
+                    diskSections.begin(),
+                    diskSections.end(),
+                    [&](const DllSectionFlags& disk) {
+
+                        return
+                            disk.name ==
+                            memorySection.name &&
+                            disk.virtualAddress ==
+                            memorySection.virtualAddress;
+                    }
+                );
+
+            if (
+                diskIt ==
+                diskSections.end()) {
+
+                continue;
+            }
+
+            DWORD diskFlags =
+                diskIt->characteristics;
+
+            DWORD memoryFlags =
+                memorySection.characteristics;
+
+            bool flagsChanged =
+                diskFlags != memoryFlags;
+
+            bool memoryRWX =
+                (
+                    memoryFlags &
+                    IMAGE_SCN_MEM_EXECUTE
+                    ) != 0 &&
+                (
+                    memoryFlags &
+                    IMAGE_SCN_MEM_WRITE
+                    ) != 0 &&
+                (
+                    memoryFlags &
+                    IMAGE_SCN_MEM_READ
+                    ) != 0;
+
+            if (
+                !flagsChanged &&
+                !memoryRWX) {
+
+                continue;
+            }
+
+            int risk =
+                flagsChanged
+                ? 90
+                : 80;
+
+            std::string flags;
+
+            if (flagsChanged) {
+
+                flags +=
+                    "DLL_FLAGS_MODIFIED";
+            }
+
+            if (memoryRWX) {
+
+                if (!flags.empty())
+                    flags += ",";
+
+                flags +=
+                    "RWX_SECTION";
+
+                risk =
+                    std::max(
+                        risk,
+                        95
+                    );
+            }
+
+            std::string reportKey =
+                "dllflags:" +
+                std::to_string(pid) +
+                ":" +
+                WideToUtf8(module.path) +
+                ":" +
+                memorySection.name;
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    reportMutex_
+                );
+
+                if (
+                    !reported_.insert(
+                        reportKey
+                    ).second) {
+
+                    continue;
+                }
+            }
+
+            std::ostringstream detail;
+
+            detail
+                << "risk="
+                << risk
+
+                << ";pid="
+                << pid
+
+                << ";module="
+                << JsonEscapeW(
+                    module.name
+                )
+
+                << ";path="
+                << JsonEscapeW(
+                    module.path
+                )
+
+                << ";section="
+                << JsonEscape(
+                    memorySection.name
+                )
+
+                << ";virtual_address=0x"
+                << std::hex
+                << std::uppercase
+                << memorySection.virtualAddress
+
+                << ";disk_characteristics=0x"
+                << diskFlags
+
+                << ";memory_characteristics=0x"
+                << memoryFlags
+                << std::dec
+
+                << ";flags="
+                << flags
+
+                << ";reason=";
+
+            if (flagsChanged) {
+
+                detail
+                    << "pe_section_characteristics_changed";
+
+            }
+            else {
+
+                detail
+                    << "rwx_section";
+            }
+
+            logger_.Warn(
+                "DLL FLAGS ALERT: " +
+                detail.str()
+            );
+
+            reporter_.SendEvent(
+                "memory_alert",
+                sessionId_,
+                detail.str(),
+                flags
+            );
+        }
+    }
+
+    // ========================================================
+    // MEMORY: EXECUTABLE SECTION READER
+    // ========================================================
+
+    std::vector<MemoryBaseline::Section>
+        ReadExecutableSections(
+            HANDLE process,
+            const ModuleInfo& module) {
+
+        std::vector<MemoryBaseline::Section>
+            result;
+
+        IMAGE_DOS_HEADER dos{};
+
+        SIZE_T read = 0;
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    module.base
+                    ),
+                &dos,
+                sizeof(dos),
+                &read
+            ) ||
+            read != sizeof(dos) ||
+            dos.e_magic !=
+            IMAGE_DOS_SIGNATURE) {
+
+            return result;
+        }
+
+        if (
+            dos.e_lfanew <= 0 ||
+            dos.e_lfanew >
+            1024 * 1024) {
+
+            return result;
+        }
+
+        uintptr_t ntAddress =
+            module.base +
+            static_cast<uintptr_t>(
+                dos.e_lfanew
+                );
+
+        DWORD signature = 0;
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    ntAddress
+                    ),
+                &signature,
+                sizeof(signature),
+                &read
+            ) ||
+            read != sizeof(signature) ||
+            signature !=
+            IMAGE_NT_SIGNATURE) {
+
+            return result;
+        }
+
+        IMAGE_FILE_HEADER fileHeader{};
+
+        uintptr_t fileHeaderAddress =
+            ntAddress +
+            sizeof(DWORD);
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    fileHeaderAddress
+                    ),
+                &fileHeader,
+                sizeof(fileHeader),
+                &read
+            ) ||
+            read != sizeof(fileHeader)) {
+
+            return result;
+        }
+
+        if (
+            fileHeader.NumberOfSections == 0 ||
+            fileHeader.NumberOfSections > 96) {
+
+            return result;
+        }
+
+        WORD magic = 0;
+
+        uintptr_t optionalAddress =
+            fileHeaderAddress +
+            sizeof(IMAGE_FILE_HEADER);
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    optionalAddress
+                    ),
+                &magic,
+                sizeof(magic),
+                &read
+            ) ||
+            read != sizeof(magic) ||
+            magic !=
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+
+            return result;
+        }
+
+        uintptr_t sectionAddress =
+            optionalAddress +
+            fileHeader.SizeOfOptionalHeader;
+
+        std::vector<IMAGE_SECTION_HEADER>
+            sections(
+                fileHeader.NumberOfSections
+            );
+
+        SIZE_T sectionBytes =
+            sections.size() *
+            sizeof(IMAGE_SECTION_HEADER);
+
+        if (
+            !ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(
+                    sectionAddress
+                    ),
+                sections.data(),
+                sectionBytes,
+                &read
+            ) ||
+            read != sectionBytes) {
+
+            return result;
+        }
+
+        for (
+            const auto& section :
+            sections) {
+
+            DWORD characteristics =
+                section.Characteristics;
+
+            bool executable =
+                (
+                    characteristics &
+                    IMAGE_SCN_MEM_EXECUTE
+                    ) != 0;
+
+            bool writable =
+                (
+                    characteristics &
+                    IMAGE_SCN_MEM_WRITE
+                    ) != 0;
+
+            if (!executable || writable)
+                continue;
+
+            DWORD sectionSize =
+                section.Misc.VirtualSize;
+
+            if (sectionSize == 0)
+                continue;
+
+            sectionSize =
+                std::min<DWORD>(
+                    sectionSize,
+                    64 * 1024 * 1024
+                );
+
+            uintptr_t address =
+                module.base +
+                section.VirtualAddress;
+
+            std::vector<BYTE> buffer(
+                sectionSize
+            );
+
+            SIZE_T bytesRead = 0;
+
+            if (
+                !ReadProcessMemory(
+                    process,
+                    reinterpret_cast<LPCVOID>(
+                        address
+                        ),
+                    buffer.data(),
+                    sectionSize,
+                    &bytesRead
+                )) {
+
+                continue;
+            }
+
+            if (bytesRead == 0)
+                continue;
+
+            std::string hash =
+                Sha256Buffer(
+                    buffer.data(),
+                    bytesRead
+                );
+
+            if (hash.empty())
+                continue;
+
+            MemoryBaseline::Section info;
+
+            info.address =
+                address;
+
+            info.size =
+                static_cast<DWORD>(
+                    bytesRead
+                    );
+
+            info.hash =
+                std::move(hash);
+
+            result.push_back(
+                std::move(info)
+            );
+        }
+
+        return result;
+    }
+
+    // ========================================================
+    // PRIVATE EXECUTABLE MEMORY
+    // ========================================================
+
+    void ScanPrivateExecutableMemory(
+        HANDLE process,
+        DWORD pid,
+        const std::vector<ModuleInfo>& modules) {
+
+        std::unordered_set<uintptr_t>
+            moduleBases;
+
+        for (
+            const auto& module :
+            modules) {
+
+            if (module.base != 0)
+                moduleBases.insert(
+                    module.base
+                );
+        }
+
+        SYSTEM_INFO si{};
+
+        GetSystemInfo(
+            &si
+        );
+
+        uintptr_t address =
+            reinterpret_cast<uintptr_t>(
+                si.lpMinimumApplicationAddress
+                );
+
+        uintptr_t maximum =
+            reinterpret_cast<uintptr_t>(
+                si.lpMaximumApplicationAddress
+                );
+
+        while (
+            address < maximum) {
+
+            MEMORY_BASIC_INFORMATION mbi{};
+
+            SIZE_T result =
+                VirtualQueryEx(
+                    process,
+                    reinterpret_cast<LPCVOID>(
+                        address
+                        ),
+                    &mbi,
+                    sizeof(mbi)
+                );
+
+            if (
+                result !=
+                sizeof(mbi)) {
+
+                break;
+            }
+
+            uintptr_t regionBase =
+                reinterpret_cast<uintptr_t>(
+                    mbi.BaseAddress
+                    );
+
+            SIZE_T regionSize =
+                mbi.RegionSize;
+
+            if (regionSize == 0)
+                break;
+
+            bool committed =
+                mbi.State ==
+                MEM_COMMIT;
+
+            bool privateMemory =
+                mbi.Type ==
+                MEM_PRIVATE;
+
+            bool executable =
+                IsExecuteProtection(
+                    mbi.Protect
+                );
+
+            bool writable =
+                IsWriteProtection(
+                    mbi.Protect
+                );
+
+            bool rwx =
+                executable &&
+                writable;
+
+            if (
+                committed &&
+                privateMemory &&
+                executable) {
+
+                std::string flags =
+                    "PRIVATE_EXECUTABLE";
+
+                int risk =
+                    75;
+
+                if (rwx) {
+
+                    flags +=
+                        ",RWX_MEMORY";
+
+                    risk =
+                        95;
+                }
+
+                std::string reportKey =
+                    "private_exec:" +
+                    std::to_string(pid) +
+                    ":" +
+                    std::to_string(regionBase);
+
+                bool shouldReport = false;
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        reportMutex_
+                    );
+
+                    if (
+                        reported_.insert(
+                            reportKey
+                        ).second) {
+
+                        shouldReport =
+                            true;
+                    }
+                }
+
+                if (shouldReport) {
+
+                    std::ostringstream detail;
+
+                    detail
+                        << "risk="
+                        << risk
+
+                        << ";pid="
+                        << pid
+
+                        << ";address=0x"
+                        << std::hex
+                        << std::uppercase
+                        << regionBase
+                        << std::dec
+
+                        << ";size="
+                        << regionSize
+
+                        << ";type=MEM_PRIVATE"
+
+                        << ";protect="
+                        << HexDword(
+                            mbi.Protect
+                        )
+
+                        << ";allocation_protect="
+                        << HexDword(
+                            mbi.AllocationProtect
+                        )
+
+                        << ";flags="
+                        << flags
+
+                        << ";reason="
+                        << (
+                            rwx
+                            ? "private_rwx_memory"
+                            : "private_executable_memory"
+                            );
+
+                    logger_.Warn(
+                        "PRIVATE MEMORY ALERT: " +
+                        detail.str()
+                    );
+
+                    reporter_.SendEvent(
+                        "memory_alert",
+                        sessionId_,
+                        detail.str(),
+                        flags
+                    );
+                }
+            }
+
+            if (
+                regionBase >
+                maximum - regionSize) {
+
+                break;
+            }
+
+            address =
+                regionBase +
+                regionSize;
+        }
+    }
+
+    // ========================================================
+    // MEMORY MONITOR
+    // ========================================================
+
+    void ScanGameMemory(
+        DWORD pid) {
+
+        HANDLE process =
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION |
+                PROCESS_VM_READ,
+                FALSE,
+                pid
+            );
+
+        if (!process)
+            return;
+
+        auto modules =
+            EnumerateModules(
+                pid
+            );
+
+        if (modules.empty()) {
+
+            CloseHandle(process);
+            return;
+        }
+
+        // ----------------------------------------------------
+        // 1. PE section flags
+        // ----------------------------------------------------
+
+        for (
+            const auto& module :
+            modules) {
+
+            if (
+                module.base == 0 ||
+                module.size == 0 ||
+                module.path.empty()) {
+
+                continue;
+            }
+
+            ScanDllSectionFlags(
+                process,
+                pid,
+                module
+            );
+        }
+
+        // ----------------------------------------------------
+        // 2. Private executable memory
+        // ----------------------------------------------------
+
+        ScanPrivateExecutableMemory(
+            process,
+            pid,
+            modules
+        );
+
+        // ----------------------------------------------------
+        // 3. Executable section content integrity
+        // ----------------------------------------------------
+
+        for (
+            const auto& module :
+            modules) {
+
+            if (
+                module.base == 0 ||
+                module.size == 0 ||
+                module.path.empty()) {
+
+                continue;
+            }
+
+            auto currentSections =
+                ReadExecutableSections(
+                    process,
+                    module
+                );
+
+            if (currentSections.empty())
+                continue;
+
+            std::string moduleKey =
+                std::to_string(pid) +
+                ":" +
+                std::to_string(module.base);
+
+            bool firstSeen = false;
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    memoryMutex_
+                );
+
+                if (
+                    !memoryBaselines_.count(
+                        moduleKey
+                    )) {
+
+                    MemoryBaseline baseline;
+
+                    baseline.base =
+                        module.base;
+
+                    baseline.size =
+                        module.size;
+
+                    baseline.modulePath =
+                        WideToUtf8(
+                            module.path
+                        );
+
+                    baseline.sections =
+                        currentSections;
+
+                    memoryBaselines_[moduleKey] =
+                        std::move(baseline);
+
+                    firstSeen =
+                        true;
+                }
+            }
+
+            if (firstSeen)
+                continue;
+
+            std::vector<
+                MemoryBaseline::Section
+            > changedSections;
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    memoryMutex_
+                );
+
+                auto it =
+                    memoryBaselines_.find(
+                        moduleKey
+                    );
+
+                if (
+                    it ==
+                    memoryBaselines_.end()) {
+
+                    continue;
+                }
+
+                auto& baseline =
+                    it->second;
+
+                for (
+                    auto& current :
+                    currentSections) {
+
+                    auto old =
+                        std::find_if(
+                            baseline.sections.begin(),
+                            baseline.sections.end(),
+                            [&](const auto& section) {
+
+                                return
+                                    section.address ==
+                                    current.address;
+                            }
+                        );
+
+                    if (
+                        old ==
+                        baseline.sections.end()) {
+
+                        continue;
+                    }
+
+                    if (
+                        old->hash !=
+                        current.hash) {
+
+                        old->changedCount++;
+
+                        current.changedCount =
+                            old->changedCount;
+
+                        changedSections.push_back(
+                            current
+                        );
+                    }
+                    else {
+
+                        old->changedCount =
+                            0;
+                    }
+                }
+            }
+
+            for (
+                const auto& section :
+                changedSections) {
+
+                if (
+                    section.changedCount < 2) {
+
+                    continue;
+                }
+
+                std::string reportKey =
+                    "memory:" +
+                    std::to_string(pid) +
+                    ":" +
+                    std::to_string(
+                        section.address
+                    );
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        reportMutex_
+                    );
+
+                    if (
+                        !reported_.insert(
+                            reportKey
+                        ).second) {
+
+                        continue;
+                    }
+                }
+
+                std::ostringstream detail;
+
+                detail
+                    << "risk=70"
+
+                    << ";pid="
+                    << pid
+
+                    << ";module="
+                    << JsonEscapeW(
+                        module.name
+                    )
+
+                    << ";path="
+                    << JsonEscapeW(
+                        module.path
+                    )
+
+                    << ";address=0x"
+                    << std::hex
+                    << std::uppercase
+                    << section.address
+                    << std::dec
+
+                    << ";size="
+                    << section.size
+
+                    << ";flags="
+                    << "MEMORY_CHANGED"
+
+                    << ";reason="
+                    << "executable_memory_changed"
+
+                    << ";consecutive_changes="
+                    << section.changedCount;
+
+                logger_.Warn(
+                    "MEMORY ALERT: " +
+                    detail.str()
+                );
+
+                reporter_.SendEvent(
+                    "memory_alert",
+                    sessionId_,
+                    detail.str(),
+                    "MEMORY_CHANGED"
+                );
+            }
+        }
+
+        CloseHandle(process);
+    }
+
+    // ========================================================
+    // REGISTRY
+    // ========================================================
+
+    void RegistryLoop() {
+
+        std::thread hkcu(
+            &AntiCheat::RegistryWatch,
+            this,
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "HKCU_RUN"
+        );
+
+        std::thread hklm(
+            &AntiCheat::RegistryWatch,
+            this,
+            HKEY_LOCAL_MACHINE,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "HKLM_RUN"
+        );
+
+        hkcu.join();
+        hklm.join();
+    }
+
+    void RegistryWatch(
+        HKEY root,
+        const wchar_t* subKey,
+        const char* keyName) {
+
+        HKEY key =
+            nullptr;
+
+        LONG result =
+            RegOpenKeyExW(
+                root,
+                subKey,
+                0,
+                KEY_NOTIFY,
+                &key
+            );
+
+        if (
+            result !=
+            ERROR_SUCCESS) {
+
+            logger_.Warn(
+                std::string(
+                    "Registry monitor unavailable: "
+                ) +
+                keyName +
+                ";error=" +
+                std::to_string(
+                    result
+                )
+            );
+
+            return;
+        }
+
+        HANDLE changeEvent =
+            CreateEventW(
+                nullptr,
+                FALSE,
+                FALSE,
+                nullptr
+            );
+
+        if (!changeEvent) {
+
+            RegCloseKey(key);
+
+            logger_.Error(
+                std::string(
+                    "Unable to create registry event: "
+                ) +
+                keyName
+            );
+
+            return;
+        }
+
+        while (!stop_) {
+
+            result =
+                RegNotifyChangeKeyValue(
+                    key,
+                    FALSE,
+                    REG_NOTIFY_CHANGE_NAME |
+                    REG_NOTIFY_CHANGE_LAST_SET |
+                    REG_NOTIFY_CHANGE_ATTRIBUTES,
+                    changeEvent,
+                    TRUE
+                );
+
+            if (
+                result !=
+                ERROR_SUCCESS) {
+
+                logger_.Warn(
+                    std::string(
+                        "RegNotifyChangeKeyValue failed: "
+                    ) +
+                    keyName +
+                    ";error=" +
+                    std::to_string(
+                        result
+                    )
+                );
+
+                break;
+            }
+
+            HANDLE handles[2] = {
+                stopEvent_,
+                changeEvent
+            };
+
+            DWORD wait =
+                WaitForMultipleObjects(
+                    2,
+                    handles,
+                    FALSE,
+                    INFINITE
+                );
+
+            if (
+                wait ==
+                WAIT_OBJECT_0) {
+
+                break;
+            }
+
+            if (
+                wait ==
+                WAIT_OBJECT_0 + 1) {
+
+                std::string detail =
+                    std::string(
+                        "key="
+                    ) +
+                    keyName +
+                    ";action=changed"
+                    ";flags=REGISTRY_CHANGED";
+
+                logger_.Warn(
+                    "Registry change: " +
+                    detail
+                );
+
+                reporter_.SendEvent(
+                    "registry_change",
+                    sessionId_,
+                    detail,
+                    "REGISTRY_CHANGED"
+                );
+
+                continue;
+            }
+
+            break;
+        }
+
+        CloseHandle(
+            changeEvent
+        );
+
+        RegCloseKey(
+            key
+        );
+    }
+
+    // ========================================================
+    // SCANNER
+    // ========================================================
+
+    void ScannerLoop() {
+
+        while (!stop_) {
+
+            auto processes =
+                EnumerateProcesses();
+
+            for (
+                const auto& process :
+                processes) {
+
+                std::string reason;
+
+                int risk =
+                    CalculateRisk(
+                        process,
+                        reason
+                    );
+
+                if (risk < 50)
+                    continue;
+
+                std::string key =
+                    std::to_string(
+                        process.pid
+                    ) +
+                    ":" +
+                    process.sha256 +
+                    ":" +
+                    std::to_string(
+                        risk
+                    );
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        reportMutex_
+                    );
+
+                    if (
+                        !reported_.insert(
+                            key
+                        ).second) {
+
+                        continue;
+                    }
+                }
+
+                std::ostringstream detail;
+
+                detail
+                    << "risk="
+                    << risk
+
+                    << ";name="
+                    << JsonEscapeW(
+                        process.name
+                    )
+
+                    << ";pid="
+                    << process.pid
+
+                    << ";ppid="
+                    << process.parentPid
+
+                    << ";signature=";
+
+                switch (
+                    process.signature) {
+
+                case SignatureState::Valid:
+                    detail << "valid";
+                    break;
+
+                case SignatureState::Invalid:
+                    detail << "invalid";
+                    break;
+
+                default:
+                    detail << "unknown";
+                    break;
+                }
+
+                detail
+                    << ";hash_state="
+                    << (
+                        process.hashState ==
+                        HashState::Valid
+                        ? "valid"
+                        : "unavailable"
+                        )
+
+                    << ";sha256="
+                    << process.sha256
+
+                    << ";path="
+                    << JsonEscapeW(
+                        process.path
+                    )
+
+                    << ";flags="
+                    << "PROCESS_SUSPICIOUS"
+
+                    << ";reason="
+                    << reason;
+
+                logger_.Warn(
+                    "PROCESS ALERT: " +
+                    detail.str()
+                );
+
+                reporter_.SendEvent(
+                    "process_alert",
+                    sessionId_,
+                    detail.str(),
+                    "PROCESS_SUSPICIOUS"
+                );
+            }
+
+            // =================================================
+            // CS2 DETECTION
+            // =================================================
+
+            DWORD cs2Pid =
+                FindGamePid();
+
+            bool wasRunning =
+                seenGame_.load();
+
+            // -------------------------------------------------
+            // CS2 STARTED
+            // -------------------------------------------------
+
+            if (
+                cs2Pid != 0 &&
+                !wasRunning) {
+
+                seenGame_ =
+                    true;
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        memoryMutex_
+                    );
+
+                    memoryBaselines_.clear();
+                }
+
+                std::string detail =
+                    "pid=" +
+                    std::to_string(
+                        cs2Pid
+                    );
+
+                reporter_.SendEvent(
+                    "game_started_under_ac",
+                    sessionId_,
+                    detail
+                );
+
+                if (cfg_.showOverlay) {
+
+                    std::thread(
+                        ShowOverlayForSeconds,
+                        cfg_.overlaySeconds
+                    ).detach();
+                }
+
+                ReportLaunchChain(
+                    cs2Pid
+                );
+            }
+
+            // -------------------------------------------------
+            // MODULE SCAN
+            // -------------------------------------------------
+
+            if (cs2Pid != 0) {
+
+                ScanGameModules(
+                    cs2Pid
+                );
+            }
+
+            // -------------------------------------------------
+            // MEMORY SCAN
+            // -------------------------------------------------
+
+            if (cs2Pid != 0) {
+
+                ScanGameMemory(
+                    cs2Pid
+                );
+            }
+
+            // -------------------------------------------------
+            // CS2 CLOSED
+            // -------------------------------------------------
+
+            else if (wasRunning) {
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        moduleMutex_
+                    );
+
+                    knownModules_.clear();
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        memoryMutex_
+                    );
+
+                    memoryBaselines_.clear();
+                }
+
+                seenGame_ =
+                    false;
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(
+                    std::max(
+                        500,
+                        cfg_.scanIntervalMs
+                    )
+                )
+            );
+        }
+    }
+
+    // ========================================================
+    // HEARTBEAT
+    // ========================================================
+
+    void HeartbeatLoop() {
+
+        while (!stop_) {
+
+            bool game =
+                FindGamePid() != 0;
+
+            auto uptime =
+                std::chrono::duration_cast<
+                std::chrono::seconds>(
+                    std::chrono::steady_clock::now() -
+                    startedAt_
+                ).count();
+
+            std::ostringstream detail;
+
+            detail
+                << "game_running="
+                << (
+                    game
+                    ? "true"
+                    : "false"
+                    )
+
+                << ";ac_uptime_sec="
+                << uptime;
+
+            reporter_.SendEvent(
+                "heartbeat",
+                sessionId_,
+                detail.str()
+            );
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(
+                    std::max(
+                        1000,
+                        cfg_.heartbeatIntervalMs
+                    )
+                )
+            );
+        }
+    }
+
+    // ========================================================
+    // WATCHDOG
+    // ========================================================
+
+    void WatchdogLoop() {
+
+        while (!stop_) {
+
+            reporter_.SendEvent(
+                "watchdog",
+                sessionId_,
+                "alive=true"
+            );
+
+            std::this_thread::sleep_for(
+                std::chrono::seconds(
+                    10
+                )
+            );
+        }
+    }
+
+private:
+
+    Config cfg_;
+
+    Logger& logger_;
+    Reporter& reporter_;
+
+    std::string sessionId_;
+
+    std::chrono::steady_clock::time_point
+        startedAt_ =
+        std::chrono::steady_clock::now();
+
+    // ========================================================
+    // FILE CACHE
+    // ========================================================
+
+    std::unordered_map<
+        std::wstring,
+        CachedFile
+    > fileCache_;
+
+    // ========================================================
+    // REPORTED EVENTS
+    // ========================================================
+
+    std::unordered_set<
+        std::string
+    > reported_;
+
+    // ========================================================
+    // MODULE TRACKING
+    // ========================================================
+
+    std::unordered_map<
+        DWORD,
+        std::unordered_set<
+        std::wstring
+        >
+    > knownModules_;
+
+    // ========================================================
+    // MEMORY BASELINES
+    // ========================================================
+
+    std::unordered_map<
+        std::string,
+        MemoryBaseline
+    > memoryBaselines_;
+
+    std::mutex cacheMutex_;
+    std::mutex reportMutex_;
+    std::mutex moduleMutex_;
+    std::mutex memoryMutex_;
+
+    std::atomic<bool>
+        seenGame_{ false };
+
+    std::atomic<bool>
+        stop_{ false };
+
+    HANDLE stopEvent_ =
+        nullptr;
+};
+
+// ============================================================
+// PATH
+// ============================================================
+
+static fs::path GetExecutableDirectory() {
+
+    wchar_t buffer[32768]{};
+
+    DWORD len =
+        GetModuleFileNameW(
+            nullptr,
+            buffer,
+            (DWORD)std::size(
+                buffer
+            )
+        );
+
+    if (len == 0)
+        return fs::current_path();
+
+    return fs::path(
+        std::wstring(
+            buffer,
+            len
+        )
+    ).parent_path();
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+int wmain() {
+
+    SetConsoleOutputCP(
+        CP_UTF8
+    );
+
+    SetConsoleCP(
+        CP_UTF8
+    );
+
+    HRESULT comResult =
+        CoInitializeEx(
+            nullptr,
+            COINIT_MULTITHREADED
+        );
+
+    bool comInitialized =
+        SUCCEEDED(comResult);
+
+    Config cfg;
+
+    fs::path base =
+        GetExecutableDirectory();
+
+    fs::path logPath =
+        base /
+        L"anticheat.log";
+
+    Logger logger(
+        logPath
+    );
+
+    logger.Info(
+        "CS2 AntiCheat v0.1.0"
+    );
+
+    logger.Info(
+        "Built-in config enabled"
+    );
+
+    Reporter reporter(
+        cfg,
+        logger
+    );
+
+    AntiCheat ac(
+        cfg,
+        logger,
+        reporter
+    );
+
+    ac.Run();
+
+    if (comInitialized)
+        CoUninitialize();
+
+    return 0;
+}
