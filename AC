@@ -123,9 +123,8 @@ void RunAsHelper() {
 
 // --- РЕЖИМ РАБОТЫ №2: ГЛАВНЫЙ АНТИЧИТ ---
 void RunAsAntiCheat() {
-    std::cout << "==================================================\n";
-    std::cout << "         СИСТЕМА ЗАЩИТЫ ТУРНИРА АКТИВИРОВАНА      \n";
-    std::cout << "==================================================\n\n";
+    std::cout << "v0.1.0\n";
+
 
     std::cout << "[?] Введите ваш Ник или ID для турнира: ";
     std::cin >> player_name;
@@ -150,19 +149,19 @@ void RunAsAntiCheat() {
 
     // Запускаем процесс БЕЗ ОКОН (флаг CREATE_NO_WINDOW)
     if (CreateProcessW(HELPER_EXE.c_str(), &commandLine[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        std::cout << "[🟢] Дополнительный фоновый модуль успешно активирован.\n";
+        std::cout << "[+]\n";
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
     else {
-        std::cout << "[❌] Критическая ошибка: Не удалось запустить фоновый модуль защиты!\n";
+        std::cout << "[-]\n";
         system("pause");
         return;
     }
 
     // Отправляем админу лог, что игрок успешно вошел в систему защиты
-    SendAlertToAdmin("编 Игрок [" + player_name + "] запустил античит. Защита активна.");
-    std::cout << "\n[🛡️] Сканирование системы запущено. Можете открывать игру.\n";
+    SendAlertToAdmin("[" + player_name + "] online");
+    std::cout << "\n[+]\n";
 
     // Базовый черный список читов для проверки процессов
     std::vector<std::wstring> bad_procs = { L"cheatengine-x86_64.exe", L"extremeinjector.exe", L"cheat_loader.exe" };
