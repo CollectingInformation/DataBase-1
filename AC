@@ -1,280 +1,525 @@
-#include <winsock2.h> // <- ТЕПЕРЬ ОНА НА САМОМ ВЕРХУ!
-#include <ws2tcpip.h>
-#include <windows.h>  
-#include <tlhelp32.h>
-#include <vector>
-#include <string>
+// CS2AntiCheat - single-file v0.2
+// Build: Visual Studio 2022, x64, C++17
+// Project setting: C/C++ -> Advanced -> Compile As -> Compile as C++ Code (/TP)
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+#include <Windows.h>
+#include <TlHelp32.h>
+#include <Psapi.h>
+#include <Softpub.h>
+#include <Wincrypt.h>
+#include <Wintrust.h>
+#include <Shlwapi.h>
+#include <Winsock2.h>
+#include <Ws2tcpip.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-
-// Подключаем сетевую библиотеку Windows к компилятору
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "Wintrust.lib")
+#pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Psapi.lib")
 
-// --- КОНСТАНТЫ НАСТРОЕК ---
-const std::wstring TARGET_GAME = L"cs2.exe";
-const std::wstring MAIN_EXE = L"anticheat.exe";
-const std::wstring HELPER_EXE = L"ac_helper.exe";
+namespace fs = std::filesystem;
 
-// Адрес твоей админ-панели (127.0.0.1 для локального теста на одном ПК)
-const std::string ADMIN_IP = "127.0.0.1";
-const int ADMIN_PORT = 54000;
+struct Config {
+    std::wstring gameProcess = L"cs2.exe";
+    int scanIntervalMs = 2000;
+    int heartbeatIntervalMs = 5000;
+    std::string serverHost = "127.0.0.1";
+    int serverPort = 54000;
+    bool reportUnsignedProcesses = true;
+    std::vector<std::wstring> allowedProcesses = {
+        L"cs2.exe", L"steam.exe", L"steamwebhelper.exe", L"discord.exe",
+        L"obs64.exe", L"explorer.exe", L"svchost.exe", L"RuntimeBroker.exe"
+    };
+    std::vector<std::wstring> suspiciousNames = {
+        L"cheatengine-x86_64.exe",
+        L"extremeinjector.exe",
+        L"cheat_loader.exe",
+        L"injector.exe",
+        L"kdmapper.exe",
+        L"processhacker.exe"
+    };
+};
 
-// Глобальная переменная для хранения ника игрока
-std::string player_name = "Unknown";
-
-typedef HMODULE(WINAPI* pLoadLibraryW)(LPCWSTR);
-pLoadLibraryW originalLoadLibraryW = NULL;
-
-// Переменная, которая хранит первые 5 байт оригинальной функции
-BYTE originalBytes[5];
-
-// --- ФУНКЦИЯ ОТПРАВКИ ЛОГОВ ПО СЕТИ (WINSOCK2) ---
-void SendAlertToAdmin(const std::string& message) {
-    // 1. Инициализируем сетевую подсистему Windows (Winsock)
-    WSADATA wsData;
-    WORD ver = MAKEWORD(2, 2);
-    int wsResult = WSAStartup(ver, &wsData);
-    if (wsResult != 0) {
-        return; // Если сеть Windows повреждена, выходим
-    }
-
-    // 2. Создаем сокет (виртуальный разъем связи)
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        WSACleanup();
-        return;
-    }
-
-    // 3. Настраиваем адрес назначения (IP и Порт админки)
-    sockaddr_in hint;
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(ADMIN_PORT);
-    inet_pton(AF_INET, ADMIN_IP.c_str(), &hint.sin_addr);
-
-    // 4. Пытаемся подключиться к серверу админа
-    int connResult = connect(sock, (sockaddr*)&hint, sizeof(hint));
-    if (connResult != SOCKET_ERROR) {
-        // Если подключение успешно — отправляем текст сообщения
-        send(sock, message.c_str(), (int)message.length(), 0);
-    }
-
-    // 5. Корректно закрываем сокет и очищаем сетевую память за собой
-    closesocket(sock);
-    WSACleanup();
+static std::string WideToUtf8(const std::wstring& s) {
+    if (s.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    return out;
 }
 
-// --- ФУНКЦИЯ ПОИСКА ПРОЦЕССА ПО ИМЕНИ ---
-DWORD GetPidByName(const std::wstring& procName) {
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring out(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n);
+    return out;
+}
 
-    // Делаем снимок всех активных процессов в Windows
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+static std::string JsonEscape(const std::string& s) {
+    std::ostringstream o;
+    for (char c : s) {
+        switch (c) {
+        case '\"': o << "\\\""; break;
+        case '\\': o << "\\\\"; break;
+        case '\n': o << "\\n"; break;
+        case '\r': o << "\\r"; break;
+        case '\t': o << "\\t"; break;
+        default: o << c;
+        }
+    }
+    return o.str();
+}
 
-    // Перебираем процессы в цикле
-    if (Process32FirstW(hSnapshot, &pe32)) {
+static std::string JsonEscapeW(const std::wstring& s) {
+    return JsonEscape(WideToUtf8(s));
+}
+
+class Logger {
+public:
+    explicit Logger(const fs::path& path) : path_(path) {}
+
+    void Info(const std::string& msg) { Write("INFO", msg); }
+    void Warn(const std::string& msg) { Write("WARN", msg); }
+    void Error(const std::string& msg) { Write("ERROR", msg); }
+
+private:
+    void Write(const char* level, const std::string& msg) {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::ofstream f(path_, std::ios::app);
+        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm tm{};
+        localtime_s(&tm, &now);
+        f << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+          << " [" << level << "] " << msg << "\n";
+        std::cout << "[" << level << "] " << msg << "\n";
+    }
+    fs::path path_;
+    std::mutex mu_;
+};
+
+static bool ReadWholeFile(const fs::path& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static std::string GetJsonString(const std::string& text, const std::string& key, const std::string& fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = text.find(needle);
+    if (p == std::string::npos) return fallback;
+    p = text.find(':', p + needle.size());
+    if (p == std::string::npos) return fallback;
+    p = text.find('"', p + 1);
+    if (p == std::string::npos) return fallback;
+    size_t e = text.find('"', p + 1);
+    if (e == std::string::npos) return fallback;
+    return text.substr(p + 1, e - p - 1);
+}
+
+static int GetJsonInt(const std::string& text, const std::string& key, int fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = text.find(needle);
+    if (p == std::string::npos) return fallback;
+    p = text.find(':', p + needle.size());
+    if (p == std::string::npos) return fallback;
+    ++p;
+    while (p < text.size() && isspace((unsigned char)text[p])) ++p;
+    try { return std::stoi(text.substr(p)); } catch (...) { return fallback; }
+}
+
+static bool GetJsonBool(const std::string& text, const std::string& key, bool fallback) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = text.find(needle);
+    if (p == std::string::npos) return fallback;
+    p = text.find(':', p + needle.size());
+    if (p == std::string::npos) return fallback;
+    std::string tail = text.substr(p + 1, 16);
+    if (tail.find("true") != std::string::npos) return true;
+    if (tail.find("false") != std::string::npos) return false;
+    return fallback;
+}
+
+static Config LoadConfig(const fs::path& path) {
+    Config c;
+    std::string s;
+    if (!ReadWholeFile(path, s)) return c;
+    c.gameProcess = Utf8ToWide(GetJsonString(s, "game_process", WideToUtf8(c.gameProcess)));
+    c.scanIntervalMs = GetJsonInt(s, "scan_interval_ms", c.scanIntervalMs);
+    c.heartbeatIntervalMs = GetJsonInt(s, "heartbeat_interval_ms", c.heartbeatIntervalMs);
+    c.serverHost = GetJsonString(s, "server_host", c.serverHost);
+    c.serverPort = GetJsonInt(s, "server_port", c.serverPort);
+    c.reportUnsignedProcesses = GetJsonBool(s, "report_unsigned_processes", c.reportUnsignedProcesses);
+    return c;
+}
+
+static std::wstring ToLowerW(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), towlower);
+    return s;
+}
+
+static std::string Sha256File(const fs::path& path) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return {};
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    std::string result;
+
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        GetLastError() != NTE_BAD_KEYSET) {
+        CloseHandle(hFile);
+        return {};
+    }
+    if (!hProv && !CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        CloseHandle(hFile);
+        return {};
+    }
+
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        CloseHandle(hFile);
+        return {};
+    }
+
+    std::vector<BYTE> buf(1024 * 1024);
+    DWORD read = 0;
+    while (ReadFile(hFile, buf.data(), (DWORD)buf.size(), &read, nullptr) && read) {
+        if (!CryptHashData(hHash, buf.data(), read, 0)) {
+            CryptDestroyHash(hHash);
+            CryptReleaseContext(hProv, 0);
+            CloseHandle(hFile);
+            return {};
+        }
+    }
+
+    BYTE hash[32];
+    DWORD hashLen = sizeof(hash);
+    if (CryptGetHashParam(hHash, HP_HASHVAL, hash, &hashLen, 0)) {
+        std::ostringstream oss;
+        for (DWORD i = 0; i < hashLen; ++i)
+            oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        result = oss.str();
+    }
+
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    CloseHandle(hFile);
+    return result;
+}
+
+static bool IsDigitallySigned(const fs::path& path) {
+    WINTRUST_FILE_INFO fi{};
+    fi.cbStruct = sizeof(fi);
+    fi.pcwszFilePath = path.c_str();
+
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_IGNORE;
+    wd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    LONG status = WinVerifyTrust(nullptr, &policy, &wd);
+    return status == ERROR_SUCCESS;
+}
+
+static std::wstring QueryProcessPath(HANDLE hProcess) {
+    wchar_t path[MAX_PATH * 4]{};
+    DWORD size = (DWORD)std::size(path);
+    if (QueryFullProcessImageNameW(hProcess, 0, path, &size))
+        return std::wstring(path, size);
+    return {};
+}
+
+static DWORD QueryParentPid(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD parent = 0;
+
+    if (Process32FirstW(snap, &pe)) {
         do {
-            // Сравниваем имя текущего процесса с искомым (без учета регистра букв)
-            if (_wcsicmp(pe32.szExeFile, procName.c_str()) == 0) {
-                CloseHandle(hSnapshot);
-                return pe32.th32ProcessID; // Нашли! Возвращаем его ID
+            if (pe.th32ProcessID == pid) {
+                parent = pe.th32ParentProcessID;
+                break;
             }
-        } while (Process32NextW(hSnapshot, &pe32));
+        } while (Process32NextW(snap, &pe));
     }
-
-    CloseHandle(hSnapshot);
-    return 0; // Процесс не запущен
+    CloseHandle(snap);
+    return parent;
 }
 
-// --- ФУНКЦИЯ ПРИНУДИТЕЛЬНОГО ЗАКРЫТИЯ ИГРЫ ---
-void KillProcess(DWORD pid) {
-    if (pid == 0) return;
-    // Открываем процесс игры с правами на его уничтожение
-    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-    if (hProcess) {
-        TerminateProcess(hProcess, 0); // Жестко тушим игру
-        CloseHandle(hProcess);
-    }
-}
+struct ProcInfo {
+    DWORD pid{};
+    DWORD parentPid{};
+    std::wstring name;
+    std::wstring path;
+    std::string sha256;
+    bool signedFile{};
+};
 
-// --- РЕЖИМ РАБОТЫ №1: СКРЫТЫЙ ФОНОВЫЙ ХЕЛПЕР ---
-void RunAsHelper() {
-    // Ждем 2 секунды, чтобы главное окно успело полностью проинициализироваться
-    Sleep(2000);
-
-    // Бесконечный цикл мониторинга главного окна
-    while (true) {
-        // Если главный античит пропал из процессов — значит читер его закрыл
-        if (GetPidByName(MAIN_EXE) == 0) {
-            // Ищем запущенную игру
-            DWORD gamePid = GetPidByName(TARGET_GAME);
-            if (gamePid != 0) {
-                KillProcess(gamePid); // Закрываем игру аварийно
-            }
-
-            // Шлем экстренный лог админу
-            SendAlertToAdmin("🚨 КРИТ: Игрок принудительно ЗАКРЫЛ основное окно античета (anticheat.exe)! Игра экстренно завершена.");
-            return; // Хелпер завершает работу
-        }
-        Sleep(1000); // Проверяем каждую секунду, чтобы не грузить CPU
-    }
-}
-
-// --- РЕЖИМ РАБОТЫ №2: ГЛАВНЫЙ АНТИЧИТ ---
-void RunAsAntiCheat() {
-    std::cout << "v0.1.0\n";
-
-
-    std::cout << "[?] Введите ваш Ник или ID для турнира: ";
-    std::cin >> player_name;
-
-    // КЛОНИРОВАНИЕ: Узнаем полный путь, где лежит текущий запущенный .exe
-    wchar_t currentPath[MAX_PATH];
-    GetModuleFileNameW(NULL, currentPath, MAX_PATH);
-
-    // Автоматически создаем физическую копию себя под именем ac_helper.exe
-    // Копирование сработает, только если файла еще нет или он не запущен
-    CopyFileW(currentPath, HELPER_EXE.c_str(), FALSE);
-
-    // НАСТРОЙКА ЗАПУСКА: Запускаем созданный ac_helper.exe
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-
-    // Секретный аргумент "--helper" сообщает программе, что она должна включить скрытый режим
-    std::wstring commandLine = HELPER_EXE + L" --helper";
-
-    // Запускаем процесс БЕЗ ОКОН (флаг CREATE_NO_WINDOW)
-    if (CreateProcessW(HELPER_EXE.c_str(), &commandLine[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        std::cout << "[+]\n";
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
-    else {
-        std::cout << "[-]\n";
-        system("pause");
-        return;
+class Reporter {
+public:
+    Reporter(const Config& c, Logger& log) : cfg_(c), log_(log) {
+        WSAStartup(MAKEWORD(2, 2), &wsa_);
     }
 
-    // Отправляем админу лог, что игрок успешно вошел в систему защиты
-    SendAlertToAdmin("[" + player_name + "] online");
-    std::cout << "\n[+]\n";
+    ~Reporter() { WSACleanup(); }
 
-    // Базовый черный список читов для проверки процессов
-    std::vector<std::wstring> bad_procs = { L"cheatengine-x86_64.exe", L"extremeinjector.exe", L"cheat_loader.exe" };
+    void SendEvent(const std::string& json) {
+        log_.Info("EVENT " + json);
 
-    // Бесконечный цикл сканирования
-    while (true) {
-        // 1. Проверяем, жив ли наш хелпер
-        if (GetPidByName(HELPER_EXE) == 0) {
-            SendAlertToAdmin("🚨 КРИТ: Игрок [" + player_name + "] принудительно СНЯЛ процесс хелпера (ac_helper.exe)!");
-            DWORD gamePid = GetPidByName(TARGET_GAME);
-            if (gamePid != 0) KillProcess(gamePid);
-            return;
-        }
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return;
 
-        // 2. Сканируем систему на запущенные читы из черного списка
-        for (const auto& bad : bad_procs) {
-            if (GetPidByName(bad) != 0) {
-                SendAlertToAdmin("🚨 ЧИТ: У игрока [" + player_name + "] обнаружен запущенный софт из черного списка!");
-                DWORD gamePid = GetPidByName(TARGET_GAME);
-                if (gamePid != 0) KillProcess(gamePid); // Моментально закрываем игру
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((u_short)cfg_.serverPort);
+
+        if (InetPtonA(AF_INET, cfg_.serverHost.c_str(), &addr.sin_addr) != 1) {
+            addrinfo hints{};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* result = nullptr;
+
+            if (getaddrinfo(cfg_.serverHost.c_str(), nullptr, &hints, &result) != 0 || !result) {
+                closesocket(s);
                 return;
             }
+
+            auto* ipv4 = reinterpret_cast<sockaddr_in*>(result->ai_addr);
+            addr.sin_addr = ipv4->sin_addr;
+            freeaddrinfo(result);
         }
 
-        Sleep(1500); // Проверка каждые 1.5 секунды
-    }
-}
+        // Short timeout; failure to reach the local server must not block the scanner.
+        DWORD timeoutMs = 500;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
 
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-// --- НАША КАСЛЕННАЯ ФУНКЦИЯ-ФИЛЬТР ---
-HMODULE WINAPI HookedLoadLibraryW(LPCWSTR lpLibFileName) {
-    std::wstring dllName(lpLibFileName);
-
-    // Проверяем, какую DLL пытается загрузить система или чит
-    // Если в имени есть подозрительные слова, или это не системная DLL Windows
-    if (dllName.find(L"cheat") != std::wstring::npos || dllName.find(L"hack") != std::wstring::npos) {
-
-        // Шлем алерт админу, что была попытка инжекта!
-        // ( player_name берется из глобальной переменной основного кода)
-        std::wcout << L"[🚨] БЛОКИРОВКА: Попытка инжекта запрещенной DLL: " << lpLibFileName << std::endl;
-
-
-        // Возвращаем NULL — чит думает, что функция сработала, но DLL НЕ ЗАГРУЗИТСЯ!
-        return NULL;
+        if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            std::string payload = json + "\n";
+            send(s, payload.data(), (int)payload.size(), 0);
+        }
+        closesocket(s);
     }
 
-    // Если DLL легальная (например, системная от Windows или Steam Overlay)
-    // Временно восстанавливаем оригинальные байты, чтобы не сломать игру
-    DWORD oldProtect;
-    VirtualProtect(LoadLibraryW, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(LoadLibraryW, originalBytes, 5);
+private:
+    const Config& cfg_;
+    Logger& log_;
+    WSADATA wsa_{};
+};
 
-    // Вызываем настоящую функцию
-    HMODULE hModule = LoadLibraryW(lpLibFileName);
-
-    // Ставим хук обратно для защиты от следующих атак
-    BYTE jump[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
-    DWORD_PTR relativeAddress = (DWORD_PTR)HookedLoadLibraryW - (DWORD_PTR)LoadLibraryW - 5;
-    memcpy(&jump[1], &relativeAddress, 4);
-    memcpy(LoadLibraryW, jump, 5);
-    VirtualProtect(LoadLibraryW, 5, oldProtect, &oldProtect);
-
-    return hModule;
-}
-
-// --- ФУНКЦИЯ АКТИВАЦИИ ЗАЩИТЫ (СПЛАЙСИНГ) ---
-void EnableAntiInject() {
-    // Получаем адрес функции LoadLibraryW в памяти Windows
-    void* targetFunction = (void*)LoadLibraryW;
-
-    // Разрешаем чтение и запись в область системной функции
-    DWORD oldProtect;
-    VirtualProtect(targetFunction, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-    // Сохраняем первые 5 оригинальных байт функции (чтобы потом вернуть как было)
-    memcpy(originalBytes, targetFunction, 5);
-
-    // Вычисляем относительный адрес для прыжка (JMP) на нашу HookedLoadLibraryW
-    DWORD_PTR relativeAddress = (DWORD_PTR)HookedLoadLibraryW - (DWORD_PTR)targetFunction - 5;
-
-    // Формируем инструкцию ассемблера: E9 [адрес_прыжка] (занимает ровно 5 байт)
-    BYTE jump[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
-    memcpy(&jump[1], &relativeAddress, 4);
-
-    // Перезаписываем начало системной функции нашим прыжком
-    memcpy(targetFunction, jump, 5);
-
-    // Восстанавливаем настройки защиты памяти обратно
-    VirtualProtect(targetFunction, 5, oldProtect, &oldProtect);
-
-    std::cout << "[🟢] Защита от инжектов DLL успешно активирована.\n";
-}
-
-// --- ОСНОВНАЯ ТОЧКА ВХОДА (MAIN) ---
-int main(int argc, char* argv[]) {
-    // Проверяем аргументы командной строки
-    // Если программа запущена с флагом "--helper", включаем фоновую защиту
-    if (argc > 1 && std::string(argv[1]) == "--helper") {
-
-        // На всякий случай жестко скрываем окно консоли, если Windows попытается его отобразить
-        HWND hwnd = GetConsoleWindow();
-        if (hwnd) ShowWindow(hwnd, SW_HIDE);
-
-        RunAsHelper(); // Запуск логики хелпера
+class AntiCheat {
+public:
+    AntiCheat(Config cfg, Logger& log, Reporter& reporter)
+        : cfg_(std::move(cfg)), log_(log), reporter_(reporter) {
+        wchar_t buf[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        selfPath_ = fs::path(buf);
+        sessionId_ = MakeSessionId();
     }
-    // Если запущен обычным двойным кликом — это главный античит для игрока
-    else {
-        // Настраиваем кодировку консоли Windows под русский язык
-        SetConsoleCP(1251);
-        SetConsoleOutputCP(1251);
 
-        RunAsAntiCheat(); // Запуск логики главного античета
+    void Run() {
+        log_.Info("session=" + sessionId_);
+        reporter_.SendEvent(EventJson("session_start", "session=" + sessionId_));
+
+        std::thread scanner(&AntiCheat::ScannerLoop, this);
+        std::thread heartbeat(&AntiCheat::HeartbeatLoop, this);
+        std::thread watchdog(&AntiCheat::WatchdogLoop, this);
+
+        scanner.join();
+        heartbeat.join();
+        watchdog.join();
     }
+
+private:
+    std::string MakeSessionId() {
+        GUID g{};
+        CoCreateGuid(&g);
+        wchar_t s[64]{};
+        StringFromGUID2(g, s, 64);
+        std::wstring w(s);
+        w.erase(std::remove(w.begin(), w.end(), L'{'), w.end());
+        w.erase(std::remove(w.begin(), w.end(), L'}'), w.end());
+        return WideToUtf8(w);
+    }
+
+    std::string EventJson(const std::string& type, const std::string& detail) {
+        std::ostringstream o;
+        o << "{\"event\":\"" << JsonEscape(type)
+          << "\",\"session_id\":\"" << JsonEscape(sessionId_)
+          << "\",\"detail\":\"" << JsonEscape(detail) << "\"}";
+        return o.str();
+    }
+
+    bool IsAllowed(const std::wstring& name) const {
+        auto n = ToLowerW(name);
+        for (const auto& a : cfg_.allowedProcesses)
+            if (n == ToLowerW(a)) return true;
+        return false;
+    }
+
+    bool IsSuspiciousName(const std::wstring& name) const {
+        auto n = ToLowerW(name);
+        for (const auto& bad : cfg_.suspiciousNames) {
+            if (n == ToLowerW(bad)) return true;
+        }
+        return false;
+    }
+
+    std::vector<ProcInfo> EnumerateProcesses() {
+        std::vector<ProcInfo> out;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return out;
+
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (!pe.th32ProcessID) continue;
+
+                HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+                if (!h) continue;
+
+                ProcInfo p;
+                p.pid = pe.th32ProcessID;
+                p.parentPid = QueryParentPid(p.pid);
+                p.name = pe.szExeFile;
+                p.path = QueryProcessPath(h);
+                if (!p.path.empty()) {
+                    p.sha256 = Sha256File(p.path);
+                    p.signedFile = IsDigitallySigned(p.path);
+                }
+                CloseHandle(h);
+                out.push_back(std::move(p));
+            } while (Process32NextW(snap, &pe));
+        }
+
+        CloseHandle(snap);
+        return out;
+    }
+
+    bool IsGameRunning() {
+        auto list = EnumerateProcesses();
+        for (const auto& p : list)
+            if (ToLowerW(p.name) == ToLowerW(cfg_.gameProcess))
+                return true;
+        return false;
+    }
+
+    void ScannerLoop() {
+        while (!stop_) {
+            auto list = EnumerateProcesses();
+
+            for (const auto& p : list) {
+                bool suspicious = IsSuspiciousName(p.name);
+                bool unknownUnsigned = cfg_.reportUnsignedProcesses && !IsAllowed(p.name) && !p.signedFile;
+
+                if (!suspicious && !unknownUnsigned) continue;
+
+                // De-duplicate by PID + hash so an event isn't generated every scan.
+                std::string key = std::to_string(p.pid) + ":" + p.sha256;
+                if (!reported_.insert(key).second) continue;
+
+                std::ostringstream detail;
+                detail << "name=" << JsonEscapeW(p.name)
+                       << ";pid=" << p.pid
+                       << ";ppid=" << p.parentPid
+                       << ";signed=" << (p.signedFile ? "true" : "false")
+                       << ";sha256=" << p.sha256
+                       << ";path=" << JsonEscapeW(p.path)
+                       << ";reason=" << (suspicious ? "suspicious_name" : "unknown_unsigned");
+
+                log_.Warn(detail.str());
+                reporter_.SendEvent(EventJson("process_alert", detail.str()));
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(250, cfg_.scanIntervalMs)));
+        }
+    }
+
+    void HeartbeatLoop() {
+        while (!stop_) {
+            bool game = IsGameRunning();
+            std::ostringstream d;
+            d << "game_running=" << (game ? "true" : "false")
+              << ";uptime_sec=" << (GetTickCount64() / 1000);
+            reporter_.SendEvent(EventJson("heartbeat", d.str()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1000, cfg_.heartbeatIntervalMs)));
+        }
+    }
+
+    void WatchdogLoop() {
+        const auto started = std::chrono::steady_clock::now();
+        while (!stop_) {
+            // Detect a hanging main loop at a coarse level. This does not terminate CS2.
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started).count();
+            if (age > 0) {
+                // Keep the process responsive and publish a lightweight watchdog heartbeat.
+                reporter_.SendEvent(EventJson("watchdog", "alive=true"));
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+    }
+
+    Config cfg_;
+    Logger& log_;
+    Reporter& reporter_;
+    fs::path selfPath_;
+    std::string sessionId_;
+    std::unordered_set<std::string> reported_;
+    std::atomic<bool> stop_{false};
+};
+
+int wmain() {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    fs::path base = fs::current_path();
+    fs::path configPath = base / L"config.json";
+    fs::path logPath = base / L"anticheat.log";
+
+    Config cfg = LoadConfig(configPath);
+    Logger logger(logPath);
+    logger.Info("CS2 AntiCheat v0.2 starting");
+
+    Reporter reporter(cfg, logger);
+    AntiCheat ac(cfg, logger, reporter);
+    ac.Run();
+
     return 0;
 }
