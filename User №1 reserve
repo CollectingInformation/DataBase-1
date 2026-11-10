@@ -39,12 +39,12 @@
         "license_until": "31.03.2026"
       },
       {
-        "login": "5",
+        "login": "idk",
         "role": "user",
         "status": "disable",
         "password_hash": "5",
         "hwid_hash": "5",
-        "history": "[!] The account was temporarily blocked by the administrator cyn on 7d. reason not specified. Data 26.03.2026",
+        "history": "The account was created on 11.11.2026\n\n[!] The account has been disabled due to inactivity.",
         "license_until": "2024-01-01"
       },
 
@@ -54,6 +54,7 @@
         "status": "disable",
         "password_hash": "6",
         "hwid_hash": "6",
+        "history": "[!] The account was temporarily blocked by the administrator cyn on 7d. reason not specified. Data 26.03.2026",
         "license_until": "2024-01-01"
       },
       {
